@@ -2298,6 +2298,9 @@ class GatewayRunner:
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
 
+        if self._should_ingest_telegram_media(event):
+            return await self._handle_telegram_media_ingest(event)
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -2358,6 +2361,8 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+            if event.get_command() == "jobs":
+                return await self._handle_jobs_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -2517,6 +2522,11 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+        if canonical == "jobs":
+            return await self._handle_jobs_command(event)
+
+        if canonical == "parse":
+            return await self._handle_parse_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -3922,7 +3932,230 @@ class GatewayRunner:
         ])
 
         return "\n".join(lines)
-    
+
+    @staticmethod
+    def _telegram_ingest_source_uri(event: MessageEvent) -> str:
+        source = event.source
+        if source.thread_id:
+            return f"telegram://chat/{source.chat_id}/thread/{source.thread_id}/message/{event.message_id}"
+        return f"telegram://chat/{source.chat_id}/message/{event.message_id}"
+
+    @staticmethod
+    def _telegram_ingest_source_scope(source: SessionSource) -> str:
+        if source.thread_id:
+            return f"telegram:{source.chat_id}:{source.thread_id}"
+        return f"telegram:{source.chat_id}"
+
+    @staticmethod
+    def _telegram_media_display_name(
+        event: MessageEvent,
+        path: str,
+        *,
+        index: int,
+    ) -> str:
+        raw_message = getattr(event, "raw_message", None)
+        document = getattr(raw_message, "document", None) if raw_message else None
+        if document and index == 0:
+            original = getattr(document, "file_name", None)
+            if original:
+                return Path(str(original)).name
+
+        suffix = Path(path).suffix or ".bin"
+        if event.message_type == MessageType.PHOTO:
+            return f"telegram-photo-{event.message_id}-{index + 1}{suffix}"
+        return f"telegram-attachment-{event.message_id}-{index + 1}{suffix}"
+
+    def _should_ingest_telegram_media(self, event: MessageEvent) -> bool:
+        return (
+            event.source.platform == Platform.TELEGRAM
+            and not event.is_command()
+            and bool(event.media_urls)
+            and event.message_type in (MessageType.DOCUMENT, MessageType.PHOTO)
+            and self._session_db is not None
+        )
+
+    async def _handle_telegram_media_ingest(self, event: MessageEvent) -> str:
+        """Persist Telegram photo/document uploads as orchestrator jobs."""
+        from agent.orchestrator import ArtifactType
+        from agent.orchestrator.jobs import OrchestratorJobService
+        from agent.orchestrator.models import SourceRef
+        from agent.orchestrator.reporting import format_job_summary
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        source_uri = self._telegram_ingest_source_uri(event)
+        source_scope = self._telegram_ingest_source_scope(source)
+
+        raw_message = getattr(event, "raw_message", None)
+        caption_text = getattr(raw_message, "caption", None) if raw_message else None
+        job_metadata: dict[str, Any] = {
+            "reply_target": "telegram",
+            "reply_thread_id": source.thread_id,
+            "telegram_message_id": event.message_id,
+            "telegram_chat_id": source.chat_id,
+        }
+        if caption_text:
+            job_metadata["caption_text"] = caption_text
+
+        job_type = (
+            "ingest_telegram_photo"
+            if event.message_type == MessageType.PHOTO
+            else "ingest_telegram_document"
+        )
+
+        service = OrchestratorJobService(self._session_db)
+        artifacts = []
+        for index, path in enumerate(event.media_urls):
+            mime_type = event.media_types[index] if index < len(event.media_types) else None
+            display_name = self._telegram_media_display_name(event, path, index=index)
+            artifact = service.local_storage.ingest(
+                path,
+                target_class=None,
+                display_name=display_name,
+                source_scope=source_scope,
+                source_uri=source_uri,
+                artifact_type=ArtifactType.RAW_INPUT,
+                metadata={
+                    "display_name": display_name,
+                    "telegram_media_type": mime_type,
+                    "telegram_media_index": index,
+                },
+            )
+            artifacts.append(artifact)
+
+        summary = service.create_job(
+            job_type=job_type,
+            requested_by=session_entry.session_key,
+            source=SourceRef(
+                source_type="telegram",
+                source_uri=source_uri,
+                source_scope=source_scope,
+            ),
+            intent="telegram_attachment_ingest",
+            metadata=job_metadata,
+            artifacts=artifacts,
+            auto_classify=True,
+        )
+        return (
+            f"{format_job_summary(summary)}\n\n"
+            f"Use `/jobs {summary['job_id']}` to inspect this ingest later."
+        )
+
+    async def _handle_jobs_command(self, event: MessageEvent) -> str:
+        """Handle /jobs [job_id] command."""
+        if not self._session_db:
+            return "Orchestrator state is unavailable."
+
+        from agent.orchestrator.jobs import OrchestratorJobService
+        from agent.orchestrator.reporting import (
+            format_job_summary,
+            format_job_summary_list,
+        )
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        service = OrchestratorJobService(self._session_db)
+        args = event.get_command_args().strip()
+
+        if args:
+            summary = service.get_job_summary(args)
+            if summary is None:
+                return f"Orchestrator job `{args}` was not found."
+            return format_job_summary(summary)
+
+        scoped = service.list_job_summaries(
+            requested_by=session_entry.session_key,
+            limit=10,
+        )
+        if scoped:
+            return format_job_summary_list(
+                scoped,
+                title="Current Session Orchestrator Jobs",
+            )
+
+        recent = service.list_job_summaries(limit=10)
+        return format_job_summary_list(recent)
+
+    async def _handle_parse_command(self, event: MessageEvent) -> str:
+        """Handle /parse [job_id] command - parse PDF and generate summary."""
+        if not self._session_db:
+            return "Orchestrator state is unavailable."
+
+        from agent.orchestrator.jobs import OrchestratorJobService
+        from agent.orchestrator.reporting import format_job_summary
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        service = OrchestratorJobService(self._session_db)
+        args = event.get_command_args().strip()
+
+        if not args:
+            recent = service.list_job_summaries(requested_by=session_entry.session_key, limit=5)
+            raw_archive_jobs = [
+                j for j in recent
+                if j.get("route_class") == "raw_archive" and j.get("status") not in ("completed", "failed")
+            ]
+            if not raw_archive_jobs:
+                return "No recent raw archive jobs to parse. Send a PDF first, then use `/parse <job_id>`."
+            job_id = raw_archive_jobs[0]["job_id"]
+        else:
+            job_id = args
+
+        summary = service.get_job_summary(job_id)
+        if summary is None:
+            return f"Orchestrator job `{job_id}` not found."
+
+        if summary.get("status") == "completed":
+            existing_summary_artifacts = [
+                a for a in summary.get("artifacts", [])
+                if a.get("artifact_type") == "generated_report"
+            ]
+            if existing_summary_artifacts:
+                summary_path = Path(existing_summary_artifacts[0]["storage_path"])
+                if summary_path.exists():
+                    try:
+                        content = summary_path.read_text(encoding="utf-8")
+                        preview = content[:2000]
+                        truncated = len(content) > 2000
+                        return (
+                            f"**Summary for `{job_id}`:**\n\n"
+                            f"{preview}"
+                            f"\n\n_[...truncated]_" if truncated else ""
+                        )
+                    except Exception:
+                        return (
+                            f"**Summary for `{job_id}`:**\n\n"
+                            f"Available at: {summary_path}"
+                        )
+                return (
+                    f"Job `{job_id}` already has a summary.\n\n"
+                    f"**Summary:** {summary_path}"
+                )
+            return f"Job `{job_id}` is already completed but has no summary artifact."
+
+        try:
+            result = await service.parse_pdf_job(job_id)
+            summary_artifacts = [
+                a for a in result.get("artifacts", [])
+                if a.get("artifact_type") == "generated_report"
+            ]
+            if summary_artifacts:
+                summary_path = summary_artifacts[0]["storage_path"]
+                try:
+                    summary_content = Path(summary_path).read_text(encoding="utf-8")
+                    summary_preview = summary_content[:1500]
+                    if len(summary_content) > 1500:
+                        summary_preview += "\n\n_[truncated]_"
+                    return f"**Summary for `{job_id}`:**\n\n{summary_preview}"
+                except Exception:
+                    return f"Summary generated for job `{job_id}` at:\n`{summary_path}`"
+            return format_job_summary(result)
+        except KeyError as e:
+            return str(e)
+        except Exception as e:
+            logger.warning("Failed to parse job %s: %s", job_id, e)
+            return f"Failed to parse job `{job_id}`: {str(e)}"
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
 
