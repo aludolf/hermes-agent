@@ -2652,20 +2652,97 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    def _record_bot_peer_message(self, event: "MessageEvent") -> None:
+        """Append a bot-peer group message to the local JSONL inbox.
+
+        Used by the bot-peer loop-safety guard. Records bot-to-bot group
+        messages so harness scripts (e.g. Hal driving Rauru tests) can read
+        back replies without the LLM agent ever being invoked for them.
+
+        File: ~/.hermes/bot_peer_inbox.jsonl (one JSON object per line).
+        """
+        import json as _json
+        import time as _time
+        from pathlib import Path as _Path
+        source = event.source
+        rec = {
+            "ts": _time.time(),
+            "platform": source.platform.value if source.platform else None,
+            "chat_id": source.chat_id,
+            "chat_name": source.chat_name,
+            "user_id": source.user_id,
+            "user_name": source.user_name,
+            "text": getattr(event, "text", "") or "",
+            "message_id": getattr(event, "message_id", None),
+            "reply_to_id": getattr(event, "reply_to_id", None),
+            "thread_id": source.thread_id,
+        }
+        home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
+        home.mkdir(parents=True, exist_ok=True)
+        inbox = home / "bot_peer_inbox.jsonl"
+        with inbox.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec, ensure_ascii=False) + chr(10))
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
-        
+
         This is the core message processing pipeline:
-        1. Check user authorization
-        2. Check for commands (/new, /reset, etc.)
-        3. Check for running agent and interrupt if needed
-        4. Get or create session
-        5. Build context for agent
-        6. Run agent conversation
-        7. Return response
+        1. Bot-peer drop (loop-safety): log and exit before anything else
+        2. Per-chat rate limit (loop-safety): cap agent turns per minute
+        3. Check user authorization
+        4. Check for commands (/new, /reset, etc.)
+        5. Check for running agent and interrupt if needed
+        6. Get or create session
+        7. Build context for agent
+        8. Run agent conversation
+        9. Return response
         """
         source = event.source
+
+        # -- Loop-safety guard 1: bot peers in group chats --
+        # Messages authored by KNOWN co-bots in group chats are captured to
+        # a local JSONL inbox (for harness queries) but NEVER spawn an agent
+        # session. Prevents the Hal<->Rauru reactive token-burning loop.
+        # Peer bots are listed in TELEGRAM_BOT_PEERS (comma-separated ids).
+        if source.chat_type == "group" and source.user_id:
+            _peer_env = os.getenv("TELEGRAM_BOT_PEERS", "").strip()
+            if _peer_env:
+                _peer_ids = {p.strip() for p in _peer_env.split(",") if p.strip()}
+                if source.user_id in _peer_ids:
+                    try:
+                        self._record_bot_peer_message(event)
+                    except Exception as e:
+                        logger.debug("bot peer record failed: %s", e)
+                    logger.info(
+                        "bot peer message logged (no session): %s (%s) chat=%s msg=%r",
+                        source.user_name, source.user_id, source.chat_id,
+                        (getattr(event, "text", "") or "")[:200],
+                    )
+                    return None
+
+        # -- Loop-safety guard 2: per-chat agent turn rate limit --
+        # Hard ceiling on how many agent turns a single chat may trigger
+        # per rolling 60-second window. Defaults to 20; override via env
+        # HERMES_AGENT_MAX_TURNS_PER_MINUTE. Zero or negative disables.
+        try:
+            _rl_ceiling = int(os.getenv("HERMES_AGENT_MAX_TURNS_PER_MINUTE", "20"))
+        except ValueError:
+            _rl_ceiling = 20
+        if _rl_ceiling > 0 and source.chat_id:
+            if not hasattr(self, "_chat_turn_history"):
+                self._chat_turn_history = {}
+            import time as _time
+            _now = _time.monotonic()
+            _hist = self._chat_turn_history.setdefault(source.chat_id, [])
+            _hist[:] = [t for t in _hist if _now - t < 60.0]
+            if len(_hist) >= _rl_ceiling:
+                logger.warning(
+                    "Chat rate limit hit: chat=%s turns=%d/%d in last 60s -- dropping message",
+                    source.chat_id, len(_hist), _rl_ceiling,
+                )
+                return None
+            _hist.append(_now)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -2808,6 +2885,8 @@ class GatewayRunner:
                 return await self._handle_status_command(event)
             if event.get_command() == "jobs":
                 return await self._handle_jobs_command(event)
+            if event.get_command() == "parse":
+                return await self._handle_parse_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -4460,6 +4539,17 @@ class GatewayRunner:
             return f"telegram-photo-{event.message_id}-{index + 1}{suffix}"
         return f"telegram-attachment-{event.message_id}-{index + 1}{suffix}"
 
+    @staticmethod
+    def _job_summary_has_pdf_input(summary: dict[str, Any]) -> bool:
+        for artifact in summary.get("artifacts", []):
+            if artifact.get("artifact_type") != "raw_input":
+                continue
+            if artifact.get("mime_type") == "application/pdf":
+                return True
+            if str(artifact.get("storage_path", "")).lower().endswith(".pdf"):
+                return True
+        return False
+
     def _should_ingest_telegram_media(self, event: MessageEvent) -> bool:
         return (
             event.source.platform == Platform.TELEGRAM
@@ -4553,7 +4643,10 @@ class GatewayRunner:
         args = event.get_command_args().strip()
 
         if args:
-            summary = service.get_job_summary(args)
+            summary = service.get_job_summary_for_requester(
+                args,
+                requested_by=session_entry.session_key,
+            )
             if summary is None:
                 return f"Orchestrator job `{args}` was not found."
             return format_job_summary(summary)
@@ -4568,8 +4661,7 @@ class GatewayRunner:
                 title="Current Session Orchestrator Jobs",
             )
 
-        recent = service.list_job_summaries(limit=10)
-        return format_job_summary_list(recent)
+        return "No orchestrator jobs recorded for this session yet."
 
     async def _handle_parse_command(self, event: MessageEvent) -> str:
         """Handle /parse [job_id] command - parse PDF and generate summary."""
@@ -4586,17 +4678,22 @@ class GatewayRunner:
 
         if not args:
             recent = service.list_job_summaries(requested_by=session_entry.session_key, limit=5)
-            raw_archive_jobs = [
+            parseable_jobs = [
                 j for j in recent
-                if j.get("route_class") == "raw_archive" and j.get("status") not in ("completed", "failed")
+                if j.get("route_class") == "raw_archive"
+                and j.get("status") not in ("completed", "failed")
+                and self._job_summary_has_pdf_input(j)
             ]
-            if not raw_archive_jobs:
+            if not parseable_jobs:
                 return "No recent raw archive jobs to parse. Send a PDF first, then use `/parse <job_id>`."
-            job_id = raw_archive_jobs[0]["job_id"]
+            job_id = parseable_jobs[0]["job_id"]
         else:
             job_id = args
 
-        summary = service.get_job_summary(job_id)
+        summary = service.get_job_summary_for_requester(
+            job_id,
+            requested_by=session_entry.session_key,
+        )
         if summary is None:
             return f"Orchestrator job `{job_id}` not found."
 
@@ -4612,11 +4709,10 @@ class GatewayRunner:
                         content = summary_path.read_text(encoding="utf-8")
                         preview = content[:2000]
                         truncated = len(content) > 2000
-                        return (
-                            f"**Summary for `{job_id}`:**\n\n"
-                            f"{preview}"
-                            f"\n\n_[...truncated]_" if truncated else ""
-                        )
+                        message = f"**Summary for `{job_id}`:**\n\n{preview}"
+                        if truncated:
+                            message += "\n\n_[...truncated]_"
+                        return message
                     except Exception:
                         return (
                             f"**Summary for `{job_id}`:**\n\n"
