@@ -99,16 +99,51 @@ def test_superseded_working_artifact_preserves_lineage(tmp_path):
 # Lineage integrity across promotion
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T028: cross-layer lineage updates not yet implemented")
 def test_canonical_publication_preserves_full_lineage(tmp_path):
     """After promotion, lineage traces from canonical back to raw evidence."""
+    from agent.orchestrator.jobs import OrchestratorJobService
+    from agent.orchestrator.models import SourceRef
+    from agent.orchestrator.publish import PromotionService
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        # This test will create evidence → working → candidate → publication
-        # and verify the lineage record links all four.
-        # Implementation deferred to Phase 5 (T028).
-        pytest.skip("Full lineage chain requires promotion implementation (Phase 5)")
+        job_service = OrchestratorJobService(db)
+        promo = PromotionService(db)
+
+        # 1. Ingest → evidence
+        summary = job_service.ingest_bytes(
+            filename="kb-source.pdf",
+            data=b"%PDF knowledge",
+            requested_by="test",
+            source=SourceRef(source_type="telegram", source_uri="tg://30"),
+        )
+        job_id = summary["job_id"]
+        artifacts = db.list_orchestrator_artifacts(job_id)
+        evidence_id = artifacts[0]["artifact_id"]
+
+        # 2. Working output
+        w = job_service.create_working_output(
+            job_id=job_id,
+            content=b"# Curated entry",
+            filename="curated.md",
+            artifact_kind="report",
+            evidence_id=evidence_id,
+        )
+
+        # 3. Candidate → approve → publish
+        candidate_id = promo.create_candidate(
+            job_id=job_id,
+            evidence_id=evidence_id,
+            working_id=w["working_id"],
+        )
+        promo.approve(candidate_id=candidate_id, resolved_by="test")
+        pub = promo.publish(candidate_id=candidate_id, destination_repo="Domains_KB")
+
+        # 4. Verify full lineage chain
+        lineage = job_service.get_lineage(job_id)
+        assert lineage is not None
+        assert evidence_id in lineage["evidence_ids"]
+        assert w["working_id"] in lineage["working_ids"]
     finally:
         db.close()

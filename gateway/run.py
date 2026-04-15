@@ -2883,6 +2883,8 @@ class GatewayRunner:
                 return await self._handle_jobs_command(event)
             if event.get_command() == "parse":
                 return await self._handle_parse_command(event)
+            if event.get_command() == "publish_kb":
+                return await self._handle_publish_kb_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3044,6 +3046,9 @@ class GatewayRunner:
 
         if canonical == "parse":
             return await self._handle_parse_command(event)
+
+        if canonical == "publish_kb":
+            return await self._handle_publish_kb_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -4774,6 +4779,75 @@ class GatewayRunner:
             return "⚡ Stopped. You can continue this session."
         else:
             return "No active task to stop."
+
+    async def _handle_publish_kb_command(self, event: MessageEvent) -> str:
+        """Handle /publish_kb <job_id> — promote a canonical candidate to Domains_KB."""
+        if not self._session_db:
+            return "Orchestrator state is unavailable."
+
+        from agent.orchestrator.jobs import OrchestratorJobService
+        from agent.orchestrator.publish import PromotionService
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        args = event.get_command_args().strip()
+
+        if not args:
+            return (
+                "Usage: `/publish_kb <job_id>`\n\n"
+                "Promotes a canonical candidate from the given job into Domains\\_KB.\n"
+                "The job must have been classified as `kb_candidate`."
+            )
+
+        job_service = OrchestratorJobService(self._session_db)
+        promo = PromotionService(self._session_db)
+        job_id = args
+
+        summary = job_service.get_job_summary(job_id)
+        if summary is None:
+            return f"Orchestrator job `{job_id}` was not found."
+        if summary.get("knowledge_tier") != "canonical_candidate":
+            return (
+                f"Job `{job_id}` is tier `{summary.get('knowledge_tier', 'unknown')}`, "
+                f"not `canonical_candidate`. Only canonical candidates can be published."
+            )
+
+        # Check for existing candidate or create one
+        candidates = promo.list_candidates()
+        existing = [c for c in candidates if c.get("job_id") == job_id]
+
+        if existing:
+            candidate = existing[0]
+            cid = candidate["candidate_id"]
+            if candidate["status"] == "published":
+                return f"Job `{job_id}` was already published (candidate `{cid}`)."
+            if candidate["status"] == "rejected":
+                note = candidate.get("review_summary") or "no rationale recorded"
+                return f"Job `{job_id}` was previously rejected: {note}"
+        else:
+            artifacts = self._session_db.list_orchestrator_artifacts(job_id)
+            evidence_id = artifacts[0]["artifact_id"] if artifacts else None
+            cid = promo.create_candidate(
+                job_id=job_id,
+                evidence_id=evidence_id,
+            )
+
+        # Approve and publish
+        requester = session_entry.session_key
+        promo.approve(candidate_id=cid, resolved_by=requester, note="Approved via /publish_kb")
+        result = promo.publish(
+            candidate_id=cid,
+            destination_repo="Domains_KB",
+            published_by=requester,
+        )
+
+        return (
+            f"✅ **Published to Domains\\_KB**\n\n"
+            f"**Job:** `{job_id}`\n"
+            f"**Candidate:** `{cid}`\n"
+            f"**Publication:** `{result['publication_id']}`\n"
+            f"**Validation:** `{result['validation_status']}`"
+        )
 
     async def _handle_restart_command(self, event: MessageEvent) -> str:
         """Handle /restart command - drain active work, then restart the gateway."""
