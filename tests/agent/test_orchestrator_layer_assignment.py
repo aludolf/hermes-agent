@@ -17,7 +17,6 @@ from agent.orchestrator.models import RouteClass
 # US1 Scenario 1: Inbound items get a knowledge tier alongside route class
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T009: KnowledgeTier enum not yet added to models.py")
 def test_ingest_attachment_assigns_knowledge_tier(tmp_path):
     """Every completed ingest must expose both route_class AND knowledge_tier."""
     from agent.orchestrator.models import KnowledgeTier  # noqa: F811
@@ -109,7 +108,6 @@ def test_generated_output_routes_to_working_tier():
 # US1 Scenario 3: Manual override preserves audit trail
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T016: manual layer override not yet implemented in job lifecycle")
 def test_manual_override_from_raw_to_canonical_candidate(tmp_path):
     """Operator can reclassify an item; previous tier is preserved for audit."""
     from agent.orchestrator.jobs import OrchestratorJobService
@@ -138,5 +136,83 @@ def test_manual_override_from_raw_to_canonical_candidate(tmp_path):
         assert updated["knowledge_tier"] == "canonical_candidate"
         assert updated["manual_override"] is True
         assert updated["overridden_from_tier"] == "raw_only"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# T014: Integration tests — full ingest→classify→persist→summary chain
+# ---------------------------------------------------------------------------
+
+def test_ingest_repo_file_summary_includes_working_tier(tmp_path):
+    """Repo ingest → job summary must include knowledge_tier=working."""
+    from agent.orchestrator.jobs import OrchestratorJobService
+    from agent.orchestrator.artifacts import LocalStorageAdapter
+    from agent.orchestrator.models import SourceRef
+    from hermes_state import SessionDB
+
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "README.md").write_text("# hello", encoding="utf-8")
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        service = OrchestratorJobService(
+            db, local_storage=LocalStorageAdapter(allowed_roots=[source_dir]),
+        )
+        summary = service.ingest_local_path(
+            source_dir / "README.md",
+            requested_by="cli",
+            source_scope=str(source_dir),
+            job_type="inspect_repo",
+            intent="inspect_repo",
+        )
+        assert summary["knowledge_tier"] == "working"
+        assert summary["route_class"] == "dev_workflow"
+    finally:
+        db.close()
+
+
+def test_ingest_personal_request_gets_working_tier(tmp_path):
+    """Meeting pack ingest → knowledge_tier=working in job summary."""
+    from agent.orchestrator.jobs import OrchestratorJobService
+    from agent.orchestrator.models import SourceRef
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        service = OrchestratorJobService(db)
+        summary = service.create_job(
+            job_type="meeting_pack",
+            requested_by="test",
+            source=SourceRef(source_type="telegram", source_uri="tg://5"),
+            intent="meeting_pack",
+        )
+        assert summary["knowledge_tier"] == "working"
+        assert summary["route_class"] == "personal_context"
+    finally:
+        db.close()
+
+
+def test_layer_assignment_persisted_in_db(tmp_path):
+    """Layer assignment must be stored in the DB, not just returned."""
+    from agent.orchestrator.jobs import OrchestratorJobService
+    from agent.orchestrator.models import SourceRef
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        service = OrchestratorJobService(db)
+        summary = service.ingest_bytes(
+            filename="doc.pdf",
+            data=b"%PDF",
+            requested_by="test",
+            source=SourceRef(source_type="telegram", source_uri="tg://3"),
+        )
+        # Verify DB has the layer assignment
+        layer = db.get_layer_assignment(summary["job_id"])
+        assert layer is not None
+        assert layer["knowledge_tier"] == "raw_only"
+        assert layer["route_class"] == "raw_archive"
     finally:
         db.close()

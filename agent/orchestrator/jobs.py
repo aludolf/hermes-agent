@@ -10,8 +10,8 @@ from uuid import uuid4
 from hermes_state import SessionDB
 
 from .artifacts import LocalStorageAdapter
-from .models import ArtifactType, JobStatus, NormalizedArtifact, RouteClass, SourceRef
-from .router import classify_route
+from .models import ArtifactType, JobStatus, KnowledgeTier, NormalizedArtifact, RouteClass, SourceRef
+from .router import classify_route, tier_for_route
 
 
 def _new_id(prefix: str) -> str:
@@ -197,13 +197,18 @@ class OrchestratorJobService:
 
         artifacts = self.db.list_orchestrator_artifacts(job_id)
         previous = self.db.get_routing_decision(job_id)
+        previous_assignment = self.db.get_layer_assignment(job_id)
+
         if manual_route_class:
+            knowledge_tier = tier_for_route(str(manual_route_class))
             route_decision = {
                 "route_class": str(manual_route_class),
+                "knowledge_tier": knowledge_tier,
                 "decision_reason": decision_reason or "Route manually overridden by operator.",
                 "confidence": 1.0,
                 "manual_override": True,
                 "overridden_from": previous["route_class"] if previous else None,
+                "overridden_from_tier": previous_assignment["knowledge_tier"] if previous_assignment else None,
             }
         else:
             route_decision = classify_route(job, artifacts).as_dict()
@@ -214,10 +219,38 @@ class OrchestratorJobService:
             route_class=route_decision["route_class"],
             decision_reason=route_decision["decision_reason"],
             confidence=route_decision["confidence"],
-            manual_override=route_decision["manual_override"],
-            overridden_from=route_decision["overridden_from"],
+            manual_override=route_decision.get("manual_override", False),
+            overridden_from=route_decision.get("overridden_from"),
         )
+
+        self.db.create_layer_assignment(
+            assignment_id=_new_id("layer"),
+            job_id=job_id,
+            route_class=route_decision["route_class"],
+            knowledge_tier=route_decision["knowledge_tier"],
+            decision_reason=route_decision["decision_reason"],
+            confidence=route_decision["confidence"],
+            manual_override=route_decision.get("manual_override", False),
+            overridden_from_tier=route_decision.get("overridden_from_tier"),
+        )
+
         return route_decision
+
+    def override_layer_assignment(
+        self,
+        *,
+        job_id: str,
+        new_tier: str,
+        new_route_class: str,
+        changed_by: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Reclassify a job's knowledge tier. Preserves the prior tier for audit."""
+        return self.classify_job(
+            job_id,
+            manual_route_class=new_route_class,
+            decision_reason=note or f"Manual override by {changed_by}",
+        )
 
     def request_approval(self, job_id: str, policy_name: str, *, action_id: str | None = None) -> dict[str, Any]:
         approval_id = _new_id("approval")
@@ -387,11 +420,14 @@ class OrchestratorJobService:
             artifact_summaries.append(artifact.as_summary(artifact_row["artifact_id"]))
 
         route_class = route["route_class"] if route else job["route_class"]
+        layer = self.db.get_layer_assignment(job_id)
+        knowledge_tier = layer["knowledge_tier"] if layer else tier_for_route(route_class)
         return {
             "job_id": job["job_id"],
             "job_type": job["job_type"],
             "status": job["status"],
             "route_class": route_class,
+            "knowledge_tier": knowledge_tier,
             "requested_by": job["requested_by"],
             "source": {
                 "source_type": job["source_type"],
