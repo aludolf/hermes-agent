@@ -40,7 +40,6 @@ def test_ingest_attachment_assigns_knowledge_tier(tmp_path):
         db.close()
 
 
-@pytest.mark.xfail(reason="T015: classify_route does not yet return knowledge_tier")
 def test_repo_inspection_routes_to_working_tier():
     """Repo-oriented input → dev_workflow route + working knowledge tier."""
     from agent.orchestrator.router import classify_route
@@ -54,7 +53,6 @@ def test_repo_inspection_routes_to_working_tier():
     assert decision.knowledge_tier == "working"
 
 
-@pytest.mark.xfail(reason="T015: classify_route does not yet return knowledge_tier")
 def test_kb_publish_routes_to_canonical_candidate_tier():
     """KB publication intent → kb_candidate route + canonical_candidate tier."""
     from agent.orchestrator.router import classify_route
@@ -67,7 +65,6 @@ def test_kb_publish_routes_to_canonical_candidate_tier():
     assert decision.knowledge_tier == "canonical_candidate"
 
 
-@pytest.mark.xfail(reason="T015: classify_route does not yet return knowledge_tier")
 def test_binary_attachment_routes_to_raw_only_tier():
     """Binary evidence (PDF, image) → raw_archive route + raw_only tier."""
     from agent.orchestrator.router import classify_route
@@ -84,7 +81,6 @@ def test_binary_attachment_routes_to_raw_only_tier():
 # US1 Scenario 2: Operational items preserved outside canonical KB
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T015: tier assignment for personal/task routes not yet implemented")
 def test_personal_context_routes_to_working_tier():
     """Meeting packs and briefings → personal_context + working tier."""
     from agent.orchestrator.router import classify_route
@@ -97,7 +93,6 @@ def test_personal_context_routes_to_working_tier():
     assert decision.knowledge_tier == "working"
 
 
-@pytest.mark.xfail(reason="T015: tier assignment for generated output not yet implemented")
 def test_generated_output_routes_to_working_tier():
     """Generated deliverables → generated_output + working tier."""
     from agent.orchestrator.router import classify_route

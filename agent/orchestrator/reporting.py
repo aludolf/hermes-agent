@@ -11,6 +11,13 @@ def _render_artifact_line(artifact: Mapping[str, object]) -> str:
     return f"- `{artifact.get('artifact_id', '?')}` {artifact_type}: {display_name}"
 
 
+def _render_working_artifact_line(wa: Mapping[str, object]) -> str:
+    title = wa.get("title") or wa.get("working_id") or "working artifact"
+    kind = wa.get("artifact_kind") or "unknown"
+    status = wa.get("status") or "active"
+    return f"- `{wa.get('working_id', '?')}` {kind}: {title} [{status}]"
+
+
 def format_job_summary(summary: Mapping[str, object]) -> str:
     """Render a single job summary in a Telegram-friendly markdown block."""
     lines = [
@@ -21,6 +28,10 @@ def format_job_summary(summary: Mapping[str, object]) -> str:
         f"**Status:** `{summary['status']}`",
         f"**Route:** `{summary['route_class']}`",
     ]
+
+    knowledge_tier = summary.get("knowledge_tier")
+    if knowledge_tier:
+        lines.append(f"**Tier:** `{knowledge_tier}`")
 
     next_action = summary.get("next_action")
     if next_action:
@@ -38,6 +49,11 @@ def format_job_summary(summary: Mapping[str, object]) -> str:
     if artifacts:
         lines.extend(["", "**Artifacts:**"])
         lines.extend(_render_artifact_line(artifact) for artifact in artifacts)
+
+    working_artifacts = summary.get("working_artifacts") or []
+    if working_artifacts:
+        lines.extend(["", "**Working Outputs:**"])
+        lines.extend(_render_working_artifact_line(wa) for wa in working_artifacts)
 
     approvals = summary.get("approvals") or []
     if approvals:
@@ -63,8 +79,10 @@ def format_job_summary_list(
 
     lines = [f"🧭 **{title}**", ""]
     for summary in summaries:
+        tier = summary.get("knowledge_tier", "")
+        tier_tag = f" [{tier}]" if tier else ""
         lines.append(
             f"- `{summary['job_id']}` `{summary['job_type']}` "
-            f"-> `{summary['status']}` / `{summary['route_class']}`"
+            f"-> `{summary['status']}` / `{summary['route_class']}`{tier_tag}"
         )
     return "\n".join(lines)

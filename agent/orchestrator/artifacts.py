@@ -244,3 +244,108 @@ class LocalStorageAdapter:
             raise PermissionError("LocalStorageAdapter.delete is disabled unless explicitly allowed")
         path = self._resolve_input_path(ref)
         path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# 002: Knowledge Layer Split — working + canonical destination adapters
+# ---------------------------------------------------------------------------
+
+class WorkingDestinationAdapter:
+    """Filesystem-backed adapter for durable non-canonical working artifacts.
+
+    Working artifacts (reports, meeting packs, repo inspections, drafts) land
+    here. This destination is separate from both raw storage and Domains_KB.
+    """
+
+    def __init__(self, *, root: Path) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def write(
+        self,
+        content: bytes,
+        filename: str,
+        artifact_kind: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write a working artifact and return its metadata record."""
+        kind_dir = self.root / artifact_kind
+        kind_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = Path(filename).name
+        dest = kind_dir / safe_name
+        if dest.exists():
+            dest = dest.with_name(f"{dest.stem}-{uuid4().hex[:8]}{dest.suffix}")
+        dest.write_bytes(content)
+
+        return {
+            "working_id": f"wrk_{uuid4().hex[:12]}",
+            "artifact_kind": artifact_kind,
+            "destination_backend": "working_repo",
+            "destination_path": str(dest.relative_to(self.root)),
+            "title": safe_name,
+            "status": "active",
+            "size_bytes": len(content),
+            "checksum": _sha256_bytes(content),
+            "metadata": dict(metadata or {}),
+        }
+
+    def read(self, relative_path: str) -> bytes:
+        """Read a working artifact by its relative path."""
+        full = (self.root / relative_path).resolve()
+        if not full.is_relative_to(self.root):
+            raise PermissionError(f"Path {full} is outside working root")
+        return full.read_bytes()
+
+    def list_artifacts(self, artifact_kind: str | None = None) -> list[dict[str, Any]]:
+        """List working artifacts, optionally filtered by kind."""
+        results = []
+        search_dir = self.root / artifact_kind if artifact_kind else self.root
+        if not search_dir.exists():
+            return results
+        for path in sorted(search_dir.rglob("*")):
+            if path.is_file():
+                rel = str(path.relative_to(self.root))
+                results.append({
+                    "destination_path": rel,
+                    "title": path.name,
+                    "size_bytes": path.stat().st_size,
+                })
+        return results
+
+
+class CanonicalDestinationAdapter:
+    """Adapter for writing to the canonical knowledge destination (Domains_KB).
+
+    Publication only happens through explicit promotion — this adapter
+    never writes by default. The caller (PromotionService) must have
+    already verified approval state.
+    """
+
+    def __init__(self, *, root: Path) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def publish(
+        self,
+        content: bytes,
+        filename: str,
+        *,
+        entry_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write a canonical entry to Domains_KB."""
+        dest = self.root / filename
+        if dest.exists():
+            dest = dest.with_name(f"{dest.stem}-{uuid4().hex[:8]}{dest.suffix}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+        return {
+            "entry_id": entry_id,
+            "destination_repo": "Domains_KB",
+            "destination_path": str(dest.relative_to(self.root)),
+            "size_bytes": len(content),
+            "checksum": _sha256_bytes(content),
+            "metadata": dict(metadata or {}),
+        }

@@ -81,6 +81,66 @@ class ArtifactType(StrEnum):
     DELIVERED_MESSAGE = "delivered_message"
 
 
+# ---------------------------------------------------------------------------
+# 002: Knowledge Layer Split enums
+# ---------------------------------------------------------------------------
+
+class KnowledgeTier(StrEnum):
+    """Which knowledge layer an item belongs to."""
+    RAW_ONLY = "raw_only"
+    WORKING = "working"
+    CANONICAL_CANDIDATE = "canonical_candidate"
+
+
+class CandidateState(StrEnum):
+    """Lifecycle state of a canonical candidate."""
+    PENDING_REVIEW = "pending_review"
+    APPROVED_FOR_PUBLISH = "approved_for_publish"
+    REJECTED = "rejected"
+    PUBLISHED = "published"
+    EXPIRED = "expired"
+
+
+class ConsumptionMode(StrEnum):
+    """How a bot or workflow may consume knowledge layers."""
+    CANONICAL_ONLY = "canonical_only"
+    CANONICAL_FIRST = "canonical_first"
+    WORKING_ONLY = "working_only"
+    WORKING_PLUS_CANONICAL = "working_plus_canonical"
+
+
+class ArtifactKind(StrEnum):
+    """Kind of durable working artifact."""
+    SUMMARY = "summary"
+    REPORT = "report"
+    MEETING_PACK = "meeting_pack"
+    REPO_INSPECTION = "repo_inspection"
+    DRAFT_NOTE = "draft_note"
+    TASK_BRIEF = "task_brief"
+    OTHER = "other"
+
+
+class WorkingArtifactStatus(StrEnum):
+    """Lifecycle state of a working artifact."""
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    ARCHIVED = "archived"
+
+
+class ValidationStatus(StrEnum):
+    """Validation state for canonical publications."""
+    PENDING = "pending"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class WorkingVisibility(StrEnum):
+    """What working content a consumer can see."""
+    NONE = "none"
+    OWN_OUTPUTS = "own_outputs"
+    SHARED_OUTPUTS = "shared_outputs"
+
+
 @dataclass(frozen=True)
 class SourceRef:
     """Normalized origin metadata for an orchestrator job."""
@@ -158,14 +218,18 @@ class RouteDecision:
     route_class: str
     decision_reason: str
     confidence: float
+    knowledge_tier: str = "raw_only"
     manual_override: bool = False
     overridden_from: str | None = None
+    overridden_from_tier: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "route_class": str(self.route_class),
+            "knowledge_tier": str(self.knowledge_tier),
             "decision_reason": self.decision_reason,
             "confidence": self.confidence,
             "manual_override": self.manual_override,
             "overridden_from": self.overridden_from,
+            "overridden_from_tier": self.overridden_from_tier,
         }

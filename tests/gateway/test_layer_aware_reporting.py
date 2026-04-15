@@ -15,8 +15,7 @@ import pytest
 # US1: Layer state visible in /jobs and /status output
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T013/T017: layer-aware reporting not yet implemented")
-def test_job_summary_includes_knowledge_tier(tmp_path):
+def test_job_summary_includes_knowledge_tier():
     """format_job_summary must include knowledge_tier alongside route_class."""
     from agent.orchestrator.reporting import format_job_summary
 
@@ -31,7 +30,6 @@ def test_job_summary_includes_knowledge_tier(tmp_path):
     assert "knowledge_tier" in summary.lower() or "tier" in summary.lower()
 
 
-@pytest.mark.xfail(reason="T013/T017: layer-aware list reporting not yet implemented")
 def test_job_summary_list_shows_tier_per_job():
     """Multi-job overview must show knowledge_tier for each job."""
     from agent.orchestrator.reporting import format_job_summary_list
@@ -51,7 +49,6 @@ def test_job_summary_list_shows_tier_per_job():
 # US2: Working artifact metadata in reporting
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T023: working artifact retrieval metadata not yet surfaced")
 def test_job_summary_includes_working_artifact_metadata():
     """Jobs with working outputs should surface artifact kind and destination."""
     from agent.orchestrator.reporting import format_job_summary
