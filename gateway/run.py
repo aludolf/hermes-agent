@@ -2827,6 +2827,21 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("owner list notify failed: %s", e)
 
+            # Track in orchestrator (T050)
+            try:
+                from agent.orchestrator.jobs import OrchestratorJobService
+                if self._session_db:
+                    svc = OrchestratorJobService(self._session_db)
+                    svc.track_productivity_event(
+                        event_type="list_update",
+                        title=f"{contact_name} → {list_rec['name']}: {item_text_cased}",
+                        content=item_text_cased,
+                        triggered_by=str(source.user_id),
+                        metadata={"list_name": list_rec["name"], "item": item_text_cased},
+                    )
+            except Exception as e:
+                logger.debug("productivity tracking failed: %s", e)
+
             return (
                 f"✅ Adicionei **{item_text_cased}** à lista **{list_rec['name']}**. "
                 f"Já avisei o administrador."
@@ -5297,7 +5312,23 @@ class GatewayRunner:
                 list_manager=self._list_manager,
                 reminder_service=self._reminder_service,
             )
-            return builder.build_morning_briefing()
+            result = builder.build_morning_briefing()
+
+            # Track in orchestrator (T052)
+            try:
+                from agent.orchestrator.jobs import OrchestratorJobService
+                if self._session_db:
+                    svc = OrchestratorJobService(self._session_db)
+                    svc.track_productivity_event(
+                        event_type="briefing",
+                        title="Briefing diário",
+                        content=result,
+                        triggered_by=str(source.user_id),
+                    )
+            except Exception as e:
+                logger.debug("briefing tracking failed: %s", e)
+
+            return result
         except Exception as e:
             logger.warning("Briefing build failed: %s", e)
             return f"❌ Erro ao gerar o briefing: {e}"
@@ -5353,6 +5384,22 @@ class GatewayRunner:
 
         when_str = due_dt.strftime("%d/%m às %H:%M")
         synced = " 📱 Sincronizado com Google Calendar." if rec.get("google_event_id") else ""
+
+        # Track in orchestrator (T051)
+        try:
+            from agent.orchestrator.jobs import OrchestratorJobService
+            if self._session_db:
+                svc = OrchestratorJobService(self._session_db)
+                svc.track_productivity_event(
+                    event_type="reminder",
+                    title=title,
+                    content=f"{title} @ {when_str}",
+                    triggered_by=str(source.user_id),
+                    metadata={"due_at": due_dt.isoformat(), "reminder_id": rec["reminder_id"]},
+                )
+        except Exception as e:
+            logger.debug("reminder tracking failed: %s", e)
+
         return (
             f"✅ Lembrete criado: **{title}**\n"
             f"📅 {when_str}\n"

@@ -582,3 +582,65 @@ class OrchestratorJobService:
             "candidate_ids": record.get("candidate_ids_json") or [],
             "publication_ids": record.get("publication_ids_json") or [],
         }
+
+    # ------------------------------------------------------------------
+    # Productivity tracking (003 Phase 6)
+    # ------------------------------------------------------------------
+
+    def track_productivity_event(
+        self,
+        *,
+        event_type: str,
+        title: str,
+        content: str,
+        triggered_by: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a lightweight orchestrator job + working artifact for a productivity event.
+
+        This is the bridge between the productivity layer (lists, reminders,
+        briefings) and the 002 knowledge layer. Every tracked event becomes a
+        job with a working artifact, queryable via /jobs and get_lineage.
+
+        event_type: 'list_update', 'reminder', 'briefing', 'calendar_event'
+        """
+        from .models import SourceRef
+        from .router import tier_for_route
+
+        job_id = _new_id("job")
+        self.db.create_orchestrator_job(
+            job_id=job_id,
+            job_type=f"productivity_{event_type}",
+            requested_by=triggered_by,
+            source_type="telegram",
+            intent=event_type,
+            metadata_json=metadata,
+        )
+        self.db.update_orchestrator_job_status(job_id, "completed")
+        self.db.record_routing_decision(
+            decision_id=_new_id("route"),
+            job_id=job_id,
+            route_class="generated_output",
+            decision_reason=f"Productivity event: {event_type}",
+            confidence=1.0,
+        )
+        self.db.create_layer_assignment(
+            assignment_id=_new_id("layer"),
+            job_id=job_id,
+            route_class="generated_output",
+            knowledge_tier=tier_for_route("generated_output"),
+            decision_reason=f"Productivity event: {event_type}",
+            confidence=1.0,
+        )
+
+        working_id = _new_id("wrk")
+        self.db.create_working_artifact(
+            working_id=working_id,
+            job_id=job_id,
+            artifact_kind=event_type,
+            destination_path=f"productivity/{event_type}/{job_id}.txt",
+            title=title,
+            metadata_json=metadata,
+        )
+
+        return {"job_id": job_id, "working_id": working_id, "event_type": event_type}
