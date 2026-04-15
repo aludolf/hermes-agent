@@ -176,6 +176,14 @@ class ListStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class ReminderStatus(StrEnum):
+    """Lifecycle state of a reminder."""
+    PENDING = "pending"
+    NOTIFIED = "notified"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
 @dataclass(frozen=True)
 class SourceRef:
     """Normalized origin metadata for an orchestrator job."""

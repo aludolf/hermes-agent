@@ -4,8 +4,10 @@ This package contains the shared domain model and storage helpers for the
 general orchestrator initiative.
 """
 
+from .calendar_bridge import CalendarBridge, parse_portuguese_datetime
 from .contacts import ContactManager
 from .lists import ListManager
+from .reminders import ReminderService
 from .models import (
     ActionStatus,
     ApprovalStatus,
@@ -59,6 +61,10 @@ __all__ = [
     "ListStatus",
     "ListType",
     "LocalStorageAdapter",
+    "CalendarBridge",
+    "ReminderService",
+    "ReminderStatus",
+    "parse_portuguese_datetime",
     "NormalizedArtifact",
     "OrchestratorJobService",
     "RouteClass",

@@ -644,6 +644,28 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("List manager init failed: %s", e)
 
+            # Calendar bridge + reminder service (003 — Phase 4)
+            self._calendar_bridge = None
+            self._reminder_service = None
+            try:
+                from agent.orchestrator.calendar_bridge import CalendarBridge
+                bridge = CalendarBridge()
+                if bridge.is_authenticated():
+                    self._calendar_bridge = bridge
+                    logger.info("Calendar bridge ready (Google authenticated)")
+                else:
+                    logger.info("Calendar bridge: Google not authenticated, calendar features disabled")
+            except Exception as e:
+                logger.debug("Calendar bridge init failed: %s", e)
+            try:
+                from agent.orchestrator.reminders import ReminderService
+                self._reminder_service = ReminderService(
+                    self._session_db, calendar=self._calendar_bridge,
+                )
+                logger.info("Reminder service ready")
+            except Exception as e:
+                logger.warning("Reminder service init failed: %s", e)
+
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
@@ -3173,6 +3195,12 @@ class GatewayRunner:
                 return await self._handle_list_command(event)
             if event.get_command() == "newlist":
                 return await self._handle_newlist_command(event)
+            if event.get_command() == "remind":
+                return await self._handle_remind_command(event)
+            if event.get_command() == "reminders":
+                return await self._handle_reminders_command(event)
+            if event.get_command() == "calendar":
+                return await self._handle_calendar_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3350,6 +3378,12 @@ class GatewayRunner:
             return await self._handle_list_command(event)
         if canonical == "newlist":
             return await self._handle_newlist_command(event)
+        if canonical == "remind":
+            return await self._handle_remind_command(event)
+        if canonical == "reminders":
+            return await self._handle_reminders_command(event)
+        if canonical == "calendar":
+            return await self._handle_calendar_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -5244,6 +5278,113 @@ class GatewayRunner:
             lines.append("")
 
         return "\n".join(lines).strip()
+
+    async def _handle_remind_command(self, event: MessageEvent) -> str:
+        """Handle /remind <text> <when> — create a reminder with Calendar sync."""
+        if not self._reminder_service:
+            return "Serviço de lembretes não disponível."
+
+        source = event.source
+        if self._contact_manager and not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode criar lembretes."
+
+        args = event.get_command_args().strip()
+        if not args:
+            return (
+                "Uso: `/remind <texto> <quando>`\n\n"
+                "Exemplos:\n"
+                "• `/remind Ligar para João amanhã 15:00`\n"
+                "• `/remind Enviar relatório hoje 17h`\n"
+                "• `/remind Dentista sexta 10:30`\n"
+                "• `/remind Reunião 25 de abril 14:00`"
+            )
+
+        from agent.orchestrator.calendar_bridge import parse_portuguese_datetime
+
+        # Try to find a date/time in the text. Strategy: try parsing
+        # progressively longer suffixes of the text as date expressions.
+        words = args.split()
+        title = args
+        due_dt = None
+
+        for i in range(len(words) - 1, 0, -1):
+            candidate = " ".join(words[i:])
+            dt = parse_portuguese_datetime(candidate)
+            if dt is not None:
+                title = " ".join(words[:i]).strip()
+                due_dt = dt
+                break
+
+        if due_dt is None:
+            return (
+                "❌ Não consegui entender a data/hora.\n\n"
+                "Formatos aceitos: `hoje 15:00`, `amanhã 10h`, `sexta 14:30`, "
+                "`25 de abril 09:00`"
+            )
+
+        rec = self._reminder_service.create_reminder(
+            title=title,
+            due_at=due_dt.timestamp(),
+            owner_id=str(source.user_id),
+        )
+
+        when_str = due_dt.strftime("%d/%m às %H:%M")
+        synced = " 📱 Sincronizado com Google Calendar." if rec.get("google_event_id") else ""
+        return (
+            f"✅ Lembrete criado: **{title}**\n"
+            f"📅 {when_str}\n"
+            f"🔑 `{rec['reminder_id']}`{synced}"
+        )
+
+    async def _handle_reminders_command(self, event: MessageEvent) -> str:
+        """Handle /reminders — show pending reminders."""
+        if not self._reminder_service:
+            return "Serviço de lembretes não disponível."
+
+        source = event.source
+        if self._contact_manager and not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode ver lembretes."
+
+        return self._reminder_service.format_pending_summary(owner_id=str(source.user_id))
+
+    async def _handle_calendar_command(self, event: MessageEvent) -> str:
+        """Handle /calendar [today|week] — show calendar events."""
+        if not self._calendar_bridge:
+            return "Calendário não disponível. Google OAuth não configurado."
+
+        source = event.source
+        if self._contact_manager and not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode ver a agenda."
+
+        args = event.get_command_args().strip().lower()
+
+        if args == "week" or args == "semana":
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone(timedelta(hours=-3)))
+            end = now + timedelta(days=7)
+            events = self._calendar_bridge.get_events_range(
+                now.isoformat(), end.isoformat(),
+            )
+            if not events:
+                return "📅 Sem compromissos nos próximos 7 dias."
+
+            lines = ["📅 **Agenda — próximos 7 dias**", ""]
+            for ev in events:
+                start = ev.get("start", "")
+                summary = ev.get("summary", "(sem título)")
+                if "T" in str(start):
+                    try:
+                        dt = datetime.fromisoformat(str(start))
+                        time_str = dt.strftime("%d/%m %H:%M")
+                    except ValueError:
+                        time_str = start
+                else:
+                    time_str = str(start)
+                lines.append(f"• {time_str} — {summary}")
+            return "\n".join(lines)
+
+        # Default: today
+        return self._calendar_bridge.format_today_summary()
 
     async def _handle_lists_command(self, event: MessageEvent) -> str:
         """Handle /lists — show all active shared lists with counts."""

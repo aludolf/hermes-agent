@@ -331,6 +331,27 @@ CREATE TABLE IF NOT EXISTS list_items (
 
 CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);
 CREATE INDEX IF NOT EXISTS idx_items_checked ON list_items(checked);
+
+-- Reminders with Google Calendar sync
+CREATE TABLE IF NOT EXISTS reminders (
+    reminder_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    due_at REAL NOT NULL,
+    google_event_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_at);
+
+-- Meeting reminder dedup (prevent duplicate cron notifications)
+CREATE TABLE IF NOT EXISTS meeting_reminders_sent (
+    event_id TEXT PRIMARY KEY,
+    reminded_at REAL NOT NULL
+);
 """
 
 
@@ -2151,3 +2172,99 @@ class SessionDB:
                 "DELETE FROM list_items WHERE item_id = ?", (item_id,),
             )
         self._execute_write(_do)
+
+    # =========================================================================
+    # Productivity: Reminders (003)
+    # =========================================================================
+
+    def create_reminder(
+        self, *, reminder_id, owner_id, title, due_at,
+        google_event_id=None, status="pending",
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO reminders
+                   (reminder_id, owner_id, title, due_at, google_event_id,
+                    status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (reminder_id, str(owner_id), title, due_at,
+                 google_event_id, str(status), time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_reminder(self, reminder_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM reminders WHERE reminder_id = ?",
+                (reminder_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_reminders(self, *, owner_id=None, status=None, limit=50):
+        clauses, params = [], []
+        if owner_id:
+            clauses.append("owner_id = ?"); params.append(str(owner_id))
+        if status:
+            clauses.append("status = ?"); params.append(str(status))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM reminders{where} ORDER BY due_at ASC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_reminder_status(self, reminder_id, status):
+        def _do(conn):
+            sets = ["status = ?"]
+            params = [str(status)]
+            if str(status) in ("completed", "cancelled"):
+                sets.append("completed_at = ?")
+                params.append(time.time())
+            params.append(reminder_id)
+            conn.execute(
+                f"UPDATE reminders SET {', '.join(sets)} WHERE reminder_id = ?",
+                params,
+            )
+        self._execute_write(_do)
+
+    def update_reminder_google_event_id(self, reminder_id, google_event_id):
+        def _do(conn):
+            conn.execute(
+                "UPDATE reminders SET google_event_id = ? WHERE reminder_id = ?",
+                (google_event_id, reminder_id),
+            )
+        self._execute_write(_do)
+
+    def get_reminders_due_soon(self, *, within_minutes=30):
+        """Get pending reminders due within N minutes."""
+        cutoff = time.time() + (within_minutes * 60)
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM reminders
+                   WHERE status = 'pending' AND due_at <= ?
+                   ORDER BY due_at ASC""",
+                (cutoff,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Productivity: Meeting Reminder Dedup (003)
+    # =========================================================================
+
+    def record_meeting_reminder_sent(self, event_id):
+        def _do(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO meeting_reminders_sent (event_id, reminded_at) VALUES (?, ?)",
+                (event_id, time.time()),
+            )
+        self._execute_write(_do)
+
+    def was_meeting_reminded(self, event_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM meeting_reminders_sent WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return row is not None
