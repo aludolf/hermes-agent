@@ -4,6 +4,7 @@ This package contains the shared domain model and storage helpers for the
 general orchestrator initiative.
 """
 
+from .briefing import BriefingBuilder
 from .calendar_bridge import CalendarBridge, parse_portuguese_datetime
 from .contacts import ContactManager
 from .lists import ListManager
@@ -47,6 +48,7 @@ from .jobs import OrchestratorJobService
 __all__ = [
     "ActionStatus",
     "ActionPolicyDecision",
+    "BriefingBuilder",
     "ApprovalStatus",
     "ArtifactKind",
     "ArtifactType",

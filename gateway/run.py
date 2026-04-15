@@ -3201,6 +3201,8 @@ class GatewayRunner:
                 return await self._handle_reminders_command(event)
             if event.get_command() == "calendar":
                 return await self._handle_calendar_command(event)
+            if event.get_command() == "briefing":
+                return await self._handle_briefing_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3384,6 +3386,8 @@ class GatewayRunner:
             return await self._handle_reminders_command(event)
         if canonical == "calendar":
             return await self._handle_calendar_command(event)
+        if canonical == "briefing":
+            return await self._handle_briefing_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -5278,6 +5282,25 @@ class GatewayRunner:
             lines.append("")
 
         return "\n".join(lines).strip()
+
+    async def _handle_briefing_command(self, event: MessageEvent) -> str:
+        """Handle /briefing — trigger morning briefing on demand. Owner only."""
+        source = event.source
+        if self._contact_manager and not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode ver o briefing."
+
+        try:
+            from agent.orchestrator.briefing import BriefingBuilder
+            builder = BriefingBuilder(
+                self._session_db,
+                calendar=self._calendar_bridge,
+                list_manager=self._list_manager,
+                reminder_service=self._reminder_service,
+            )
+            return builder.build_morning_briefing()
+        except Exception as e:
+            logger.warning("Briefing build failed: %s", e)
+            return f"❌ Erro ao gerar o briefing: {e}"
 
     async def _handle_remind_command(self, event: MessageEvent) -> str:
         """Handle /remind <text> <when> — create a reminder with Calendar sync."""

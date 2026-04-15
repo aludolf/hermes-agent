@@ -114,6 +114,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("calendar", "Show calendar events (owner only)", "Session",
                gateway_only=True, args_hint="[today|week]"),
+    CommandDef("briefing", "Trigger morning briefing on demand (owner only)", "Session",
+               gateway_only=True),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
