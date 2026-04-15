@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -284,6 +284,24 @@ CREATE TABLE IF NOT EXISTS consumption_policies (
 );
 
 CREATE INDEX IF NOT EXISTS idx_consumption_consumer ON consumption_policies(consumer_name);
+
+-- =====================================================================
+-- Productivity Orchestrator tables (003)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS contact_roles (
+    contact_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'pending',
+    language TEXT NOT NULL DEFAULT 'pt-BR',
+    approved_capabilities TEXT,
+    approved_by TEXT,
+    approved_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_contacts_role ON contact_roles(role);
 """
 
 
@@ -508,6 +526,10 @@ class SessionDB:
                 # v7: orchestrator tables + knowledge layer split
                 cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
                 cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                # v8: productivity orchestrator (contacts + future lists/reminders)
+                cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Ensure orchestrator tables exist for fresh databases too
         cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
@@ -1888,3 +1910,92 @@ class SessionDB:
             if d.get("metadata_json"):
                 d["metadata_json"] = json.loads(d["metadata_json"])
             return d
+
+    # =========================================================================
+    # Productivity: Contact Roles (003)
+    # =========================================================================
+
+    def create_contact_role(
+        self, *, contact_id, display_name, role="pending",
+        language="pt-BR", approved_capabilities=None, approved_by=None,
+    ):
+        def _do(conn):
+            now = time.time()
+            approved_at = now if role == "owner" or approved_by else None
+            conn.execute(
+                """INSERT OR IGNORE INTO contact_roles
+                   (contact_id, display_name, role, language,
+                    approved_capabilities, approved_by, approved_at,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (contact_id, display_name, str(role), language,
+                 json.dumps(approved_capabilities) if approved_capabilities else None,
+                 approved_by, approved_at, now, now),
+            )
+        self._execute_write(_do)
+
+    def get_contact_role(self, contact_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM contact_roles WHERE contact_id = ?",
+                (str(contact_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("approved_capabilities"):
+                d["approved_capabilities"] = json.loads(d["approved_capabilities"])
+            return d
+
+    def update_contact_role(
+        self, contact_id, *, role=None, language=None,
+        approved_capabilities=None, approved_by=None,
+    ):
+        def _do(conn):
+            sets = ["updated_at = ?"]
+            params = [time.time()]
+            if role is not None:
+                sets.append("role = ?")
+                params.append(str(role))
+                if str(role) in ("owner", "contact"):
+                    sets.append("approved_at = COALESCE(approved_at, ?)")
+                    params.append(time.time())
+            if language is not None:
+                sets.append("language = ?")
+                params.append(language)
+            if approved_capabilities is not None:
+                sets.append("approved_capabilities = ?")
+                params.append(json.dumps(approved_capabilities))
+            if approved_by is not None:
+                sets.append("approved_by = ?")
+                params.append(approved_by)
+            params.append(str(contact_id))
+            conn.execute(
+                f"UPDATE contact_roles SET {', '.join(sets)} WHERE contact_id = ?",
+                params,
+            )
+        self._execute_write(_do)
+
+    def list_contact_roles(self, *, role=None):
+        if role:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM contact_roles WHERE role = ? ORDER BY created_at DESC",
+                    (str(role),),
+                ).fetchall()
+        else:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM contact_roles ORDER BY created_at DESC"
+                ).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            if d.get("approved_capabilities"):
+                d["approved_capabilities"] = json.loads(d["approved_capabilities"])
+            result.append(d)
+        return result
+
+    def block_contact_role(self, contact_id):
+        """Block a contact. Silent — no notification, just denies access."""
+        self.update_contact_role(str(contact_id), role="blocked")

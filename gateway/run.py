@@ -619,7 +619,21 @@ class GatewayRunner:
             self._session_db = SessionDB()
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
-        
+
+        # Contact manager (003 — productivity orchestrator)
+        # Auto-registers the owner from HERMES_OWNER_TELEGRAM_ID on startup.
+        self._contact_manager = None
+        if self._session_db is not None:
+            try:
+                from agent.orchestrator.contacts import ContactManager
+                self._contact_manager = ContactManager(self._session_db)
+                owner_id = os.getenv("HERMES_OWNER_TELEGRAM_ID", "").strip()
+                if owner_id:
+                    self._contact_manager.ensure_owner(owner_id, "Owner")
+                    logger.info("Contact manager ready, owner=%s", owner_id)
+            except Exception as e:
+                logger.warning("Contact manager init failed: %s", e)
+
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
@@ -2652,6 +2666,27 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    async def _notify_owner_pending_contact(self, source) -> None:
+        """DM the owner that a new contact is pending approval."""
+        owner_id = os.getenv("HERMES_OWNER_TELEGRAM_ID", "").strip()
+        if not owner_id or not self._contact_manager:
+            return
+        try:
+            platform = source.platform
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                return
+            msg = (
+                f"👋 Novo contato pendente de aprovação:\n\n"
+                f"**Nome:** {source.user_name or '(sem nome)'}\n"
+                f"**Telegram ID:** `{source.user_id}`\n\n"
+                f"Aprovar com: `/approve_contact {source.user_id}`\n"
+                f"Bloquear com: `/block_contact {source.user_id}`"
+            )
+            await adapter.send(str(owner_id), msg)
+        except Exception as e:
+            logger.warning("Failed to notify owner of pending contact: %s", e)
+
     def _record_bot_peer_message(self, event: "MessageEvent") -> None:
         """Append a bot-peer group message to the local JSONL inbox.
 
@@ -2740,9 +2775,68 @@ class GatewayRunner:
                 return None
             _hist.append(_now)
 
+        # -- Contact role gate (003 — productivity orchestrator) --
+        # When ContactManager is active, it replaces TELEGRAM_ALLOWED_USERS for
+        # Telegram DMs: the owner gets full access, approved contacts get
+        # capability-restricted sessions, pending contacts trigger an owner
+        # approval DM, blocked contacts get silent drops.
+        #
+        # The contact system only activates for Telegram DMs with a user_id.
+        # Other platforms and group chats still use the legacy whitelist.
+        _contact_role_allowed = False
+        _contact_role_is_contact = False
+        if (
+            not getattr(event, "internal", False)
+            and self._contact_manager is not None
+            and source.platform is not None
+            and source.platform.value == "telegram"
+            and source.chat_type == "dm"
+            and source.user_id
+        ):
+            mgr = self._contact_manager
+            rec = mgr.get_role(source.user_id)
+
+            if rec is None:
+                # First contact from unknown user — register as pending + DM owner
+                try:
+                    mgr.register_pending(source.user_id, source.user_name or "")
+                except Exception as e:
+                    logger.warning("contact register failed: %s", e)
+                await self._notify_owner_pending_contact(source)
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        "Olá! Sou o Hermes, assistente pessoal. "
+                        "Seu acesso está pendente de aprovação. "
+                        "Já avisei o administrador, aguarde um momento.",
+                    )
+                return None
+
+            role = rec.get("role")
+            if role == "blocked":
+                logger.info("Blocked contact message dropped: %s", source.user_id)
+                return None
+            if role == "pending":
+                logger.info("Pending contact message: %s", source.user_id)
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        "Seu acesso ainda está pendente de aprovação. "
+                        "Aguarde o administrador aprovar.",
+                    )
+                return None
+            if role in ("owner", "contact"):
+                _contact_role_allowed = True
+                _contact_role_is_contact = (role == "contact")
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         if getattr(event, "internal", False):
+            pass
+        elif _contact_role_allowed:
+            # Contact system approved this user — skip legacy whitelist check
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -2885,6 +2979,12 @@ class GatewayRunner:
                 return await self._handle_parse_command(event)
             if event.get_command() == "publish_kb":
                 return await self._handle_publish_kb_command(event)
+            if event.get_command() == "approve_contact":
+                return await self._handle_approve_contact_command(event)
+            if event.get_command() == "block_contact":
+                return await self._handle_block_contact_command(event)
+            if event.get_command() == "contacts":
+                return await self._handle_contacts_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3049,6 +3149,13 @@ class GatewayRunner:
 
         if canonical == "publish_kb":
             return await self._handle_publish_kb_command(event)
+
+        if canonical == "approve_contact":
+            return await self._handle_approve_contact_command(event)
+        if canonical == "block_contact":
+            return await self._handle_block_contact_command(event)
+        if canonical == "contacts":
+            return await self._handle_contacts_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -4848,6 +4955,101 @@ class GatewayRunner:
             f"**Publication:** `{result['publication_id']}`\n"
             f"**Validation:** `{result['validation_status']}`"
         )
+
+    async def _handle_approve_contact_command(self, event: MessageEvent) -> str:
+        """Handle /approve_contact <telegram_id> [capability,...] — owner only."""
+        if not self._contact_manager:
+            return "Gerenciador de contatos não disponível."
+
+        source = event.source
+        if not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode aprovar contatos."
+
+        args = event.get_command_args().strip().split()
+        if not args:
+            return (
+                "Uso: `/approve_contact <telegram_id> [capabilities]`\n\n"
+                "Capabilities disponíveis: `lists`, `requests`, `reminders`\n"
+                "Padrão: `lists`\n\n"
+                "Exemplo: `/approve_contact 111222333 lists,requests`"
+            )
+
+        contact_id = args[0]
+        caps = None
+        if len(args) > 1:
+            caps = [c.strip() for c in args[1].split(",") if c.strip()]
+
+        try:
+            rec = self._contact_manager.approve_contact(
+                contact_id,
+                approved_by=str(source.user_id),
+                capabilities=caps,
+            )
+        except ValueError as e:
+            return f"❌ {e}"
+
+        caps_str = ", ".join(rec.get("approved_capabilities") or [])
+        return (
+            f"✅ Contato aprovado: **{rec.get('display_name', contact_id)}**\n"
+            f"**ID:** `{contact_id}`\n"
+            f"**Capacidades:** {caps_str}"
+        )
+
+    async def _handle_block_contact_command(self, event: MessageEvent) -> str:
+        """Handle /block_contact <telegram_id> — owner only."""
+        if not self._contact_manager:
+            return "Gerenciador de contatos não disponível."
+
+        source = event.source
+        if not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode bloquear contatos."
+
+        args = event.get_command_args().strip()
+        if not args:
+            return "Uso: `/block_contact <telegram_id>`"
+
+        rec = self._contact_manager.get_role(args)
+        if rec is None:
+            return f"Contato `{args}` não encontrado."
+
+        self._contact_manager.block_contact(args)
+        return f"🚫 Contato `{args}` ({rec.get('display_name', '')}) bloqueado."
+
+    async def _handle_contacts_command(self, event: MessageEvent) -> str:
+        """Handle /contacts — list all contacts by role. Owner only."""
+        if not self._contact_manager:
+            return "Gerenciador de contatos não disponível."
+
+        source = event.source
+        if not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode ver a lista de contatos."
+
+        contacts = self._contact_manager.list_contacts()
+        if not contacts:
+            return "Nenhum contato registrado."
+
+        lines = ["👥 **Contatos**", ""]
+        by_role = {"owner": [], "contact": [], "pending": [], "blocked": []}
+        for c in contacts:
+            by_role.setdefault(c.get("role", "unknown"), []).append(c)
+
+        role_labels = {
+            "owner": "👑 Administrador",
+            "contact": "✅ Aprovados",
+            "pending": "⏳ Pendentes",
+            "blocked": "🚫 Bloqueados",
+        }
+        for role_key, label in role_labels.items():
+            items = by_role.get(role_key, [])
+            if not items:
+                continue
+            lines.append(f"**{label}** ({len(items)})")
+            for c in items:
+                caps = ", ".join(c.get("approved_capabilities") or []) if c.get("approved_capabilities") else "—"
+                lines.append(f"- `{c['contact_id']}` {c.get('display_name', '')} [{caps}]")
+            lines.append("")
+
+        return "\n".join(lines).strip()
 
     async def _handle_restart_command(self, event: MessageEvent) -> str:
         """Handle /restart command - drain active work, then restart the gateway."""
@@ -8726,6 +8928,36 @@ class GatewayRunner:
             combined_ephemeral = context_prompt or ""
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+
+            # 003 — productivity orchestrator system prompt injection
+            # Different prompt for owner vs contact roles.
+            if self._contact_manager is not None and source.user_id:
+                try:
+                    _role_rec = self._contact_manager.get_role(source.user_id)
+                    if _role_rec:
+                        _role = _role_rec.get("role")
+                        if _role == "owner":
+                            _productivity_prompt = (
+                                "Você é o Hermes, assistente pessoal e doméstico do Alexandre. "
+                                "Responda sempre em português do Brasil, a menos que o usuário peça outro idioma. "
+                                "Você gerencia agenda, lembretes, listas de compras, material escolar, reparos "
+                                "e outras tarefas domésticas. Tem acesso completo a todas as ferramentas."
+                            )
+                            combined_ephemeral = (combined_ephemeral + "\n\n" + _productivity_prompt).strip()
+                        elif _role == "contact":
+                            _caps = _role_rec.get("approved_capabilities") or []
+                            _caps_str = ", ".join(_caps) if _caps else "nenhuma"
+                            _productivity_prompt = (
+                                f"Você é o Hermes, assistente doméstico. Responda sempre em português do Brasil. "
+                                f"Este contato ({_role_rec.get('display_name', '')}) tem permissão apenas para: {_caps_str}. "
+                                f"Quando o contato pedir para adicionar itens a uma lista, adicione e confirme em português. "
+                                f"Você NÃO deve dar acesso a: agenda, email, lembretes pessoais, ou configurações do sistema. "
+                                f"Se o contato pedir algo fora das permissões, diga gentilmente que não pode ajudar com isso "
+                                f"e ofereça encaminhar a solicitação ao administrador."
+                            )
+                            combined_ephemeral = (combined_ephemeral + "\n\n" + _productivity_prompt).strip()
+                except Exception as _e:
+                    logger.debug("productivity prompt injection failed: %s", _e)
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).

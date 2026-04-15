@@ -4,13 +4,16 @@ This package contains the shared domain model and storage helpers for the
 general orchestrator initiative.
 """
 
+from .contacts import ContactManager
 from .models import (
     ActionStatus,
     ApprovalStatus,
     ArtifactKind,
     ArtifactType,
     CandidateState,
+    Capability,
     ConsumptionMode,
+    ContactRole,
     JobStatus,
     KnowledgeTier,
     NormalizedArtifact,
@@ -43,7 +46,10 @@ __all__ = [
     "ArtifactKind",
     "ArtifactType",
     "CandidateState",
+    "Capability",
     "ConsumptionMode",
+    "ContactManager",
+    "ContactRole",
     "JobStatus",
     "KnowledgeTier",
     "LocalStorageAdapter",

@@ -141,6 +141,26 @@ class WorkingVisibility(StrEnum):
     SHARED_OUTPUTS = "shared_outputs"
 
 
+# ---------------------------------------------------------------------------
+# 003: Productivity Orchestrator enums
+# ---------------------------------------------------------------------------
+
+class ContactRole(StrEnum):
+    """Role of a Telegram contact interacting with Hermes."""
+    OWNER = "owner"
+    CONTACT = "contact"
+    PENDING = "pending"
+    BLOCKED = "blocked"
+
+
+class Capability(StrEnum):
+    """Capabilities a contact can have."""
+    LISTS = "lists"
+    REQUESTS = "requests"
+    REMINDERS = "reminders"
+    ALL = "all"
+
+
 @dataclass(frozen=True)
 class SourceRef:
     """Normalized origin metadata for an orchestrator job."""
