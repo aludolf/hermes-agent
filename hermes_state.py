@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -109,6 +109,181 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
+"""
+
+
+_ORCHESTRATOR_SCHEMA_SQL = """
+-- =====================================================================
+-- Orchestrator foundation tables (001)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS orchestrator_jobs (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    route_class TEXT NOT NULL DEFAULT 'pending_route',
+    requested_by TEXT,
+    source_type TEXT,
+    source_uri TEXT,
+    source_scope TEXT,
+    intent TEXT,
+    priority INTEGER DEFAULT 0,
+    metadata_json TEXT,
+    error_message TEXT,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    finished_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orch_jobs_status ON orchestrator_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_orch_jobs_route ON orchestrator_jobs(route_class);
+CREATE INDEX IF NOT EXISTS idx_orch_jobs_created ON orchestrator_jobs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS orchestrator_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    artifact_type TEXT NOT NULL,
+    storage_backend TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    mime_type TEXT,
+    checksum TEXT,
+    size_bytes INTEGER,
+    provenance_json TEXT,
+    metadata_json TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orch_artifacts_job ON orchestrator_artifacts(job_id);
+
+CREATE TABLE IF NOT EXISTS routing_decisions (
+    decision_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    route_class TEXT NOT NULL,
+    decision_reason TEXT,
+    confidence REAL DEFAULT 0.0,
+    manual_override INTEGER DEFAULT 0,
+    overridden_from TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_routing_job ON routing_decisions(job_id);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    approval_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    action_id TEXT,
+    policy_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    resolved_by TEXT,
+    resolution_note TEXT,
+    created_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_job ON approval_requests(job_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approval_requests(status);
+
+-- =====================================================================
+-- Knowledge layer split tables (002)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS layer_assignments (
+    assignment_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    route_class TEXT NOT NULL,
+    knowledge_tier TEXT NOT NULL,
+    decision_reason TEXT,
+    confidence REAL DEFAULT 0.0,
+    manual_override INTEGER DEFAULT 0,
+    overridden_from_tier TEXT,
+    decided_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_layer_job ON layer_assignments(job_id);
+CREATE INDEX IF NOT EXISTS idx_layer_tier ON layer_assignments(knowledge_tier);
+
+CREATE TABLE IF NOT EXISTS working_artifacts (
+    working_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    evidence_id TEXT,
+    artifact_kind TEXT NOT NULL,
+    destination_backend TEXT NOT NULL DEFAULT 'working_repo',
+    destination_path TEXT NOT NULL,
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    metadata_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_working_job ON working_artifacts(job_id);
+CREATE INDEX IF NOT EXISTS idx_working_status ON working_artifacts(status);
+
+CREATE TABLE IF NOT EXISTS canonical_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    evidence_id TEXT,
+    working_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending_review',
+    review_summary TEXT,
+    metadata_json TEXT,
+    created_at REAL NOT NULL,
+    reviewed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_status ON canonical_candidates(status);
+CREATE INDEX IF NOT EXISTS idx_candidates_job ON canonical_candidates(job_id);
+
+CREATE TABLE IF NOT EXISTS canonical_publications (
+    publication_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES canonical_candidates(candidate_id),
+    destination_repo TEXT NOT NULL,
+    entry_ids_json TEXT,
+    files_changed_json TEXT,
+    validation_status TEXT NOT NULL DEFAULT 'pending',
+    published_at REAL,
+    published_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_publications_candidate ON canonical_publications(candidate_id);
+
+CREATE TABLE IF NOT EXISTS promotion_decisions (
+    decision_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES canonical_candidates(candidate_id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    policy_name TEXT,
+    requested_at REAL NOT NULL,
+    resolved_at REAL,
+    resolved_by TEXT,
+    resolution_note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_promo_candidate ON promotion_decisions(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_promo_status ON promotion_decisions(status);
+
+CREATE TABLE IF NOT EXISTS lineage_records (
+    lineage_id TEXT PRIMARY KEY,
+    root_evidence_id TEXT NOT NULL,
+    working_ids_json TEXT,
+    candidate_ids_json TEXT,
+    publication_ids_json TEXT,
+    last_updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lineage_evidence ON lineage_records(root_evidence_id);
+
+CREATE TABLE IF NOT EXISTS consumption_policies (
+    policy_id TEXT PRIMARY KEY,
+    consumer_name TEXT NOT NULL UNIQUE,
+    mode TEXT NOT NULL DEFAULT 'canonical_first',
+    fallback_allowed INTEGER DEFAULT 1,
+    working_visibility TEXT NOT NULL DEFAULT 'none',
+    metadata_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_consumption_consumer ON consumption_policies(consumer_name);
 """
 
 
@@ -329,6 +504,13 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: orchestrator tables + knowledge layer split
+                cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
+                cursor.execute("UPDATE schema_version SET version = 7")
+
+        # Ensure orchestrator tables exist for fresh databases too
+        cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -1236,3 +1418,473 @@ class SessionDB:
             return len(session_ids)
 
         return self._execute_write(_do)
+
+    # =========================================================================
+    # Orchestrator: Jobs
+    # =========================================================================
+
+    def create_orchestrator_job(
+        self, *, job_id, job_type, requested_by, source_type=None,
+        source_uri=None, source_scope=None, intent=None, priority=0,
+        metadata_json=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO orchestrator_jobs
+                   (job_id, job_type, requested_by, source_type, source_uri,
+                    source_scope, intent, priority, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, job_type, requested_by, source_type, source_uri,
+                 source_scope, intent, priority,
+                 json.dumps(metadata_json) if metadata_json else None,
+                 time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_orchestrator_job(self, job_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM orchestrator_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("metadata_json"):
+                d["metadata_json"] = json.loads(d["metadata_json"])
+            return d
+
+    def update_orchestrator_job_status(self, job_id, status, error_message=None, route_class=None):
+        def _do(conn):
+            now = time.time()
+            sets = ["status = ?"]
+            params = [str(status)]
+            if str(status) == "running":
+                sets.append("started_at = COALESCE(started_at, ?)")
+                params.append(now)
+            if str(status) in ("completed", "failed", "cancelled"):
+                sets.append("finished_at = ?")
+                params.append(now)
+            if error_message is not None:
+                sets.append("error_message = ?")
+                params.append(error_message)
+            if route_class is not None:
+                sets.append("route_class = ?")
+                params.append(str(route_class))
+            params.append(job_id)
+            conn.execute(
+                f"UPDATE orchestrator_jobs SET {', '.join(sets)} WHERE job_id = ?",
+                params,
+            )
+        self._execute_write(_do)
+
+    def list_orchestrator_jobs(self, *, requested_by=None, status=None,
+                               route_class=None, limit=20, offset=0):
+        clauses, params = [], []
+        if requested_by:
+            clauses.append("requested_by = ?"); params.append(requested_by)
+        if status:
+            clauses.append("status = ?"); params.append(str(status))
+        if route_class:
+            clauses.append("route_class = ?"); params.append(str(route_class))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.extend([limit, offset])
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM orchestrator_jobs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                d = dict(row)
+                if d.get("metadata_json"):
+                    d["metadata_json"] = json.loads(d["metadata_json"])
+                result.append(d)
+            return result
+
+    # =========================================================================
+    # Orchestrator: Artifacts
+    # =========================================================================
+
+    def create_orchestrator_artifact(
+        self, *, artifact_id, job_id, artifact_type, storage_backend,
+        storage_path, mime_type=None, checksum=None, size_bytes=None,
+        provenance_json=None, metadata_json=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO orchestrator_artifacts
+                   (artifact_id, job_id, artifact_type, storage_backend,
+                    storage_path, mime_type, checksum, size_bytes,
+                    provenance_json, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (artifact_id, job_id, str(artifact_type), str(storage_backend),
+                 storage_path, mime_type, checksum, size_bytes,
+                 json.dumps(provenance_json) if provenance_json else None,
+                 json.dumps(metadata_json) if metadata_json else None,
+                 time.time()),
+            )
+        self._execute_write(_do)
+
+    def list_orchestrator_artifacts(self, job_id):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM orchestrator_artifacts WHERE job_id = ? ORDER BY created_at",
+                (job_id,),
+            ).fetchall()
+            result = []
+            for row in rows:
+                d = dict(row)
+                for col in ("provenance_json", "metadata_json"):
+                    if d.get(col):
+                        d[col] = json.loads(d[col])
+                result.append(d)
+            return result
+
+    # =========================================================================
+    # Orchestrator: Routing Decisions
+    # =========================================================================
+
+    def record_routing_decision(
+        self, *, decision_id, job_id, route_class, decision_reason=None,
+        confidence=0.0, manual_override=False, overridden_from=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO routing_decisions
+                   (decision_id, job_id, route_class, decision_reason,
+                    confidence, manual_override, overridden_from, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (decision_id, job_id, str(route_class), decision_reason,
+                 confidence, 1 if manual_override else 0, overridden_from,
+                 time.time()),
+            )
+            conn.execute(
+                "UPDATE orchestrator_jobs SET route_class = ? WHERE job_id = ?",
+                (str(route_class), job_id),
+            )
+        self._execute_write(_do)
+
+    def get_routing_decision(self, job_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM routing_decisions WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["manual_override"] = bool(d.get("manual_override"))
+            return d
+
+    # =========================================================================
+    # Orchestrator: Approval Requests
+    # =========================================================================
+
+    def create_approval_request(self, *, approval_id, job_id, policy_name, action_id=None):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO approval_requests
+                   (approval_id, job_id, action_id, policy_name, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (approval_id, job_id, action_id, policy_name, time.time()),
+            )
+        self._execute_write(_do)
+
+    def list_approval_requests(self, job_id):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM approval_requests WHERE job_id = ? ORDER BY created_at",
+                (job_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def resolve_approval_request(self, approval_id, *, status, resolved_by=None, resolution_note=None):
+        def _do(conn):
+            conn.execute(
+                """UPDATE approval_requests
+                   SET status = ?, resolved_by = ?, resolution_note = ?, resolved_at = ?
+                   WHERE approval_id = ?""",
+                (status, resolved_by, resolution_note, time.time(), approval_id),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Knowledge Layer: Layer Assignments
+    # =========================================================================
+
+    def create_layer_assignment(
+        self, *, assignment_id, job_id, route_class, knowledge_tier,
+        decision_reason=None, confidence=0.0, manual_override=False,
+        overridden_from_tier=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO layer_assignments
+                   (assignment_id, job_id, route_class, knowledge_tier,
+                    decision_reason, confidence, manual_override,
+                    overridden_from_tier, decided_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (assignment_id, job_id, str(route_class), str(knowledge_tier),
+                 decision_reason, confidence, 1 if manual_override else 0,
+                 overridden_from_tier, time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_layer_assignment(self, job_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM layer_assignments WHERE job_id = ? ORDER BY decided_at DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["manual_override"] = bool(d.get("manual_override"))
+            return d
+
+    # =========================================================================
+    # Knowledge Layer: Working Artifacts
+    # =========================================================================
+
+    def create_working_artifact(
+        self, *, working_id, job_id, artifact_kind, destination_backend="working_repo",
+        destination_path, title=None, evidence_id=None, metadata_json=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO working_artifacts
+                   (working_id, job_id, evidence_id, artifact_kind,
+                    destination_backend, destination_path, title, metadata_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (working_id, job_id, evidence_id, str(artifact_kind),
+                 destination_backend, destination_path, title,
+                 json.dumps(metadata_json) if metadata_json else None,
+                 time.time(), time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_working_artifact(self, working_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM working_artifacts WHERE working_id = ?", (working_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("metadata_json"):
+                d["metadata_json"] = json.loads(d["metadata_json"])
+            return d
+
+    def list_working_artifacts(self, job_id=None, *, status=None, limit=50):
+        clauses, params = [], []
+        if job_id:
+            clauses.append("job_id = ?"); params.append(job_id)
+        if status:
+            clauses.append("status = ?"); params.append(str(status))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM working_artifacts{where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                d = dict(row)
+                if d.get("metadata_json"):
+                    d["metadata_json"] = json.loads(d["metadata_json"])
+                result.append(d)
+            return result
+
+    def update_working_artifact_status(self, working_id, status):
+        def _do(conn):
+            conn.execute(
+                "UPDATE working_artifacts SET status = ?, updated_at = ? WHERE working_id = ?",
+                (str(status), time.time(), working_id),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Knowledge Layer: Canonical Candidates
+    # =========================================================================
+
+    def create_canonical_candidate(
+        self, *, candidate_id, job_id, evidence_id=None, working_id=None,
+        status="pending_review", metadata_json=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO canonical_candidates
+                   (candidate_id, job_id, evidence_id, working_id, status,
+                    metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (candidate_id, job_id, evidence_id, working_id, str(status),
+                 json.dumps(metadata_json) if metadata_json else None,
+                 time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_canonical_candidate(self, candidate_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM canonical_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("metadata_json"):
+                d["metadata_json"] = json.loads(d["metadata_json"])
+            return d
+
+    def list_canonical_candidates(self, *, status=None, limit=20):
+        if status:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM canonical_candidates WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (str(status), limit),
+                ).fetchall()
+        else:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM canonical_candidates ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            if d.get("metadata_json"):
+                d["metadata_json"] = json.loads(d["metadata_json"])
+            result.append(d)
+        return result
+
+    def update_candidate_status(self, candidate_id, status):
+        def _do(conn):
+            sets = ["status = ?"]
+            params = [str(status)]
+            if str(status) in ("approved_for_publish", "rejected"):
+                sets.append("reviewed_at = ?")
+                params.append(time.time())
+            params.append(candidate_id)
+            conn.execute(
+                f"UPDATE canonical_candidates SET {', '.join(sets)} WHERE candidate_id = ?",
+                params,
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Knowledge Layer: Canonical Publications
+    # =========================================================================
+
+    def create_canonical_publication(
+        self, *, publication_id, candidate_id, destination_repo,
+        entry_ids_json=None, files_changed_json=None,
+        validation_status="pending", published_at=None, published_by=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO canonical_publications
+                   (publication_id, candidate_id, destination_repo,
+                    entry_ids_json, files_changed_json, validation_status,
+                    published_at, published_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (publication_id, candidate_id, destination_repo,
+                 json.dumps(entry_ids_json) if entry_ids_json else None,
+                 json.dumps(files_changed_json) if files_changed_json else None,
+                 str(validation_status), published_at, published_by),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Knowledge Layer: Promotion Decisions
+    # =========================================================================
+
+    def create_promotion_decision(
+        self, *, decision_id, candidate_id, status, policy_name=None,
+        requested_at=None, resolved_at=None, resolved_by=None,
+        resolution_note=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO promotion_decisions
+                   (decision_id, candidate_id, status, policy_name,
+                    requested_at, resolved_at, resolved_by, resolution_note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (decision_id, candidate_id, str(status), policy_name,
+                 requested_at or time.time(), resolved_at, resolved_by,
+                 resolution_note),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Knowledge Layer: Lineage Records
+    # =========================================================================
+
+    def create_lineage_record(
+        self, *, lineage_id, root_evidence_id,
+        working_ids=None, candidate_ids=None, publication_ids=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO lineage_records
+                   (lineage_id, root_evidence_id, working_ids_json,
+                    candidate_ids_json, publication_ids_json, last_updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (lineage_id, root_evidence_id,
+                 json.dumps(working_ids or []),
+                 json.dumps(candidate_ids or []),
+                 json.dumps(publication_ids or []),
+                 time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_lineage_record(self, root_evidence_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM lineage_records WHERE root_evidence_id = ? ORDER BY last_updated_at DESC LIMIT 1",
+                (root_evidence_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            for col in ("working_ids_json", "candidate_ids_json", "publication_ids_json"):
+                if d.get(col):
+                    d[col] = json.loads(d[col])
+            return d
+
+    # =========================================================================
+    # Knowledge Layer: Consumption Policies
+    # =========================================================================
+
+    def create_consumption_policy(
+        self, *, policy_id, consumer_name, mode="canonical_first",
+        fallback_allowed=True, working_visibility="none", metadata_json=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO consumption_policies
+                   (policy_id, consumer_name, mode, fallback_allowed,
+                    working_visibility, metadata_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (policy_id, consumer_name, str(mode),
+                 1 if fallback_allowed else 0,
+                 str(working_visibility),
+                 json.dumps(metadata_json) if metadata_json else None,
+                 time.time(), time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_consumption_policy(self, consumer_name):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM consumption_policies WHERE consumer_name = ?",
+                (consumer_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["fallback_allowed"] = bool(d.get("fallback_allowed"))
+            if d.get("metadata_json"):
+                d["metadata_json"] = json.loads(d["metadata_json"])
+            return d
