@@ -2661,12 +2661,9 @@ class GatewayRunner:
 
         File: ~/.hermes/bot_peer_inbox.jsonl (one JSON object per line).
         """
-        import json as _json
-        import time as _time
-        from pathlib import Path as _Path
         source = event.source
         rec = {
-            "ts": _time.time(),
+            "ts": time.time(),
             "platform": source.platform.value if source.platform else None,
             "chat_id": source.chat_id,
             "chat_name": source.chat_name,
@@ -2677,11 +2674,11 @@ class GatewayRunner:
             "reply_to_id": getattr(event, "reply_to_id", None),
             "thread_id": source.thread_id,
         }
-        home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
+        home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
         home.mkdir(parents=True, exist_ok=True)
         inbox = home / "bot_peer_inbox.jsonl"
         with inbox.open("a", encoding="utf-8") as f:
-            f.write(_json.dumps(rec, ensure_ascii=False) + chr(10))
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -2731,9 +2728,8 @@ class GatewayRunner:
             _rl_ceiling = 20
         if _rl_ceiling > 0 and source.chat_id:
             if not hasattr(self, "_chat_turn_history"):
-                self._chat_turn_history = {}
-            import time as _time
-            _now = _time.monotonic()
+                self._chat_turn_history: Dict[str, List[float]] = {}
+            _now = time.monotonic()
             _hist = self._chat_turn_history.setdefault(source.chat_id, [])
             _hist[:] = [t for t in _hist if _now - t < 60.0]
             if len(_hist) >= _rl_ceiling:
