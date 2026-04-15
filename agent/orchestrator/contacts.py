@@ -128,6 +128,8 @@ class ContactManager:
         rec = self.get_role(contact_id)
         if rec is None:
             raise ValueError(f"Contact {contact_id} not found")
+        if rec.get("role") == "owner":
+            raise ValueError("Cannot re-approve the owner")
 
         caps = [str(c) for c in (capabilities or DEFAULT_CONTACT_CAPABILITIES)]
         invalid = [c for c in caps if c not in VALID_CAPABILITIES]

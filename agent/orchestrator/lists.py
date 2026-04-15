@@ -103,12 +103,27 @@ class ListManager:
         added_by: str,
         added_by_name: str | None = None,
     ) -> dict[str, Any]:
-        """Add an item to a list. Returns the item record."""
+        """Add an item to a list. Returns the item record.
+
+        Raises ValueError on empty content or archived list.
+        """
+        content = content.strip()
+        if not content:
+            raise ValueError("Item content cannot be empty")
+        if len(content) > 500:
+            raise ValueError("Item content too long (max 500 characters)")
+
+        list_rec = self.db.get_shared_list(list_id)
+        if list_rec is None:
+            raise ValueError(f"List {list_id} not found")
+        if list_rec.get("status") != "active":
+            raise ValueError(f"List '{list_rec.get('name')}' is archived")
+
         item_id = _new_id("item")
         self.db.create_list_item(
             item_id=item_id,
             list_id=list_id,
-            content=content.strip(),
+            content=content,
             added_by=str(added_by),
             added_by_name=added_by_name,
         )

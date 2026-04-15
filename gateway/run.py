@@ -2711,7 +2711,11 @@ class GatewayRunner:
             return None
 
         text = (getattr(event, "text", "") or "").strip()
-        if not text:
+        if not text or len(text) > 500:
+            return None  # empty or too long for NL pattern matching
+
+        # Skip slash commands — let the command dispatcher handle them
+        if text.startswith("/"):
             return None
 
         source = event.source
@@ -2724,7 +2728,19 @@ class GatewayRunner:
             return None
 
         contact_name = contact_rec.get("display_name") or source.user_name or "?"
-        lowered = text.lower()
+        # Strip common emoji prefixes/suffixes for cleaner pattern matching
+        import re as _re
+        _emoji_pattern = _re.compile(
+            "["
+            "\U0001F600-\U0001F64F"  # emoticons
+            "\U0001F300-\U0001F5FF"  # symbols & pictographs
+            "\U0001F680-\U0001F6FF"  # transport
+            "\U0001F1E0-\U0001F1FF"  # flags
+            "\U00002702-\U000027B0"
+            "\U000024C2-\U0001F251"
+            "]+", flags=_re.UNICODE,
+        )
+        lowered = _emoji_pattern.sub("", text.lower()).strip()
 
         # ---- Intent: show all lists ----
         if lowered in (
@@ -2810,12 +2826,15 @@ class GatewayRunner:
             else:
                 item_text_cased = item_text
 
-            self._list_manager.add_item(
-                list_rec["list_id"],
-                content=item_text_cased,
-                added_by=str(source.user_id),
-                added_by_name=contact_name,
-            )
+            try:
+                self._list_manager.add_item(
+                    list_rec["list_id"],
+                    content=item_text_cased,
+                    added_by=str(source.user_id),
+                    added_by_name=contact_name,
+                )
+            except ValueError as e:
+                return f"❌ Não foi possível adicionar: {e}"
 
             # Notify the owner (T028)
             try:
@@ -5374,6 +5393,16 @@ class GatewayRunner:
                 "❌ Não consegui entender a data/hora.\n\n"
                 "Formatos aceitos: `hoje 15:00`, `amanhã 10h`, `sexta 14:30`, "
                 "`25 de abril 09:00`"
+            )
+
+        if not title or not title.strip():
+            return "❌ O lembrete precisa de um texto. Ex: `/remind Ligar para João amanhã 15:00`"
+
+        import time as _time
+        if due_dt.timestamp() < _time.time() - 60:
+            return (
+                f"❌ A data/hora `{due_dt.strftime('%d/%m %H:%M')}` já passou. "
+                f"Use uma data futura."
             )
 
         rec = self._reminder_service.create_reminder(
