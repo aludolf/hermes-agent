@@ -15,7 +15,6 @@ import pytest
 # US2: Working destination writes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T012: working_repo destination adapter not yet created")
 def test_working_adapter_writes_report(tmp_path):
     """Working adapter must write a report to the working destination."""
     from agent.orchestrator.artifacts import WorkingDestinationAdapter
@@ -31,7 +30,6 @@ def test_working_adapter_writes_report(tmp_path):
     assert (tmp_path / "working" / result["destination_path"]).exists()
 
 
-@pytest.mark.xfail(reason="T012: working_repo destination adapter not yet created")
 def test_working_adapter_writes_meeting_pack(tmp_path):
     """Working adapter must handle meeting pack artifacts."""
     from agent.orchestrator.artifacts import WorkingDestinationAdapter
@@ -50,7 +48,6 @@ def test_working_adapter_writes_meeting_pack(tmp_path):
 # Working artifacts never treated as canonical
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T020: working destination isolation not yet enforced")
 def test_working_artifacts_not_in_canonical_destination(tmp_path):
     """Working destination must be separate from canonical (Domains_KB)."""
     from agent.orchestrator.artifacts import WorkingDestinationAdapter
@@ -71,7 +68,6 @@ def test_working_artifacts_not_in_canonical_destination(tmp_path):
 # Versioning and supersession
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="T022: working artifact versioning not yet implemented")
 def test_working_adapter_supersedes_previous_version(tmp_path):
     """Writing a new version should mark the old one as superseded."""
     from agent.orchestrator.artifacts import WorkingDestinationAdapter

@@ -1827,7 +1827,7 @@ class SessionDB:
     ):
         def _do(conn):
             conn.execute(
-                """INSERT INTO lineage_records
+                """INSERT OR REPLACE INTO lineage_records
                    (lineage_id, root_evidence_id, working_ids_json,
                     candidate_ids_json, publication_ids_json, last_updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",

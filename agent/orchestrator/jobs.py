@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from hermes_state import SessionDB
 
-from .artifacts import LocalStorageAdapter
+from .artifacts import LocalStorageAdapter, WorkingDestinationAdapter
 from .models import ArtifactType, JobStatus, KnowledgeTier, NormalizedArtifact, RouteClass, SourceRef
 from .router import classify_route, tier_for_route
 
@@ -32,9 +32,11 @@ class OrchestratorJobService:
         db: SessionDB,
         *,
         local_storage: LocalStorageAdapter | None = None,
+        working_storage: WorkingDestinationAdapter | None = None,
     ) -> None:
         self.db = db
         self.local_storage = local_storage or LocalStorageAdapter()
+        self.working_storage = working_storage
 
     @staticmethod
     def _artifact_from_row(row: Mapping[str, Any]) -> NormalizedArtifact:
@@ -435,6 +437,7 @@ class OrchestratorJobService:
                 "source_scope": job["source_scope"],
             },
             "artifacts": artifact_summaries,
+            "working_artifacts": self.db.list_working_artifacts(job_id),
             "next_action": self._next_action(job, route_class),
             "created_at": _utc_iso8601(job.get("created_at")),
             "started_at": _utc_iso8601(job.get("started_at")),
@@ -467,3 +470,115 @@ class OrchestratorJobService:
             if summary is not None:
                 summaries.append(summary)
         return summaries
+
+    # ------------------------------------------------------------------
+    # Working artifacts (US2)
+    # ------------------------------------------------------------------
+
+    def create_working_output(
+        self,
+        *,
+        job_id: str,
+        content: bytes,
+        filename: str,
+        artifact_kind: str,
+        title: str | None = None,
+        evidence_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write a durable working artifact and record it in the DB.
+
+        If a WorkingDestinationAdapter is configured, the content is also
+        written to the filesystem.  Either way, a DB record is created.
+        """
+        working_id = _new_id("wrk")
+        dest_path = f"{artifact_kind}/{filename}"
+
+        if self.working_storage:
+            result = self.working_storage.write(
+                content=content,
+                filename=filename,
+                artifact_kind=artifact_kind,
+                metadata=metadata,
+            )
+            working_id = result.get("working_id", working_id)
+            dest_path = result.get("destination_path", dest_path)
+
+        self.db.create_working_artifact(
+            working_id=working_id,
+            job_id=job_id,
+            artifact_kind=artifact_kind,
+            destination_path=dest_path,
+            title=title or filename,
+            evidence_id=evidence_id,
+            metadata_json=metadata,
+        )
+
+        # Update lineage
+        self._update_lineage_for_working(job_id, working_id, evidence_id)
+
+        return {
+            "working_id": working_id,
+            "job_id": job_id,
+            "artifact_kind": artifact_kind,
+            "destination_path": dest_path,
+            "title": title or filename,
+            "status": "active",
+        }
+
+    def supersede_working_artifact(self, working_id: str, superseded_by: str | None = None) -> None:
+        """Mark a working artifact as superseded."""
+        self.db.update_working_artifact_status(working_id, "superseded")
+
+    # ------------------------------------------------------------------
+    # Lineage (US2/US3)
+    # ------------------------------------------------------------------
+
+    def _update_lineage_for_working(
+        self, job_id: str, working_id: str, evidence_id: str | None,
+    ) -> None:
+        """Create or update a lineage record linking evidence → working artifact."""
+        if not evidence_id:
+            # Derive evidence_id from the job's first artifact
+            artifacts = self.db.list_orchestrator_artifacts(job_id)
+            if artifacts:
+                evidence_id = artifacts[0]["artifact_id"]
+        if not evidence_id:
+            return
+
+        existing = self.db.get_lineage_record(evidence_id)
+        if existing:
+            # Append working_id to existing lineage
+            wids = existing.get("working_ids_json") or []
+            if working_id not in wids:
+                wids.append(working_id)
+            # Re-create with updated list (simple upsert)
+            self.db.create_lineage_record(
+                lineage_id=existing["lineage_id"],
+                root_evidence_id=evidence_id,
+                working_ids=wids,
+                candidate_ids=existing.get("candidate_ids_json") or [],
+                publication_ids=existing.get("publication_ids_json") or [],
+            )
+        else:
+            self.db.create_lineage_record(
+                lineage_id=_new_id("lin"),
+                root_evidence_id=evidence_id,
+                working_ids=[working_id],
+            )
+
+    def get_lineage(self, job_id: str) -> dict[str, Any] | None:
+        """Return the lineage record for a job's primary evidence."""
+        artifacts = self.db.list_orchestrator_artifacts(job_id)
+        if not artifacts:
+            return None
+        evidence_id = artifacts[0]["artifact_id"]
+        record = self.db.get_lineage_record(evidence_id)
+        if not record:
+            return None
+        return {
+            "evidence_ids": [record["root_evidence_id"]],
+            "working_ids": record.get("working_ids_json") or [],
+            "candidate_ids": record.get("candidate_ids_json") or [],
+            "publication_ids": record.get("publication_ids_json") or [],
+        }
