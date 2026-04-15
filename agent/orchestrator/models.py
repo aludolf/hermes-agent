@@ -161,6 +161,21 @@ class Capability(StrEnum):
     ALL = "all"
 
 
+class ListType(StrEnum):
+    """Types of shared lists for household management."""
+    SHOPPING = "shopping"
+    SCHOOL = "school"
+    REPAIRS = "repairs"
+    ERRANDS = "errands"
+    CUSTOM = "custom"
+
+
+class ListStatus(StrEnum):
+    """Lifecycle state of a shared list."""
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
 @dataclass(frozen=True)
 class SourceRef:
     """Normalized origin metadata for an orchestrator job."""

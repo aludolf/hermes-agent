@@ -302,6 +302,35 @@ CREATE TABLE IF NOT EXISTS contact_roles (
 );
 
 CREATE INDEX IF NOT EXISTS idx_contacts_role ON contact_roles(role);
+
+-- Shared lists (shopping, school, repairs, errands, custom)
+CREATE TABLE IF NOT EXISTS shared_lists (
+    list_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    list_type TEXT NOT NULL DEFAULT 'shopping',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_by TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lists_status ON shared_lists(status);
+CREATE INDEX IF NOT EXISTS idx_lists_type ON shared_lists(list_type);
+
+CREATE TABLE IF NOT EXISTS list_items (
+    item_id TEXT PRIMARY KEY,
+    list_id TEXT NOT NULL REFERENCES shared_lists(list_id),
+    content TEXT NOT NULL,
+    checked INTEGER DEFAULT 0,
+    added_by TEXT NOT NULL,
+    added_by_name TEXT,
+    checked_by TEXT,
+    created_at REAL NOT NULL,
+    checked_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);
+CREATE INDEX IF NOT EXISTS idx_items_checked ON list_items(checked);
 """
 
 
@@ -1999,3 +2028,126 @@ class SessionDB:
     def block_contact_role(self, contact_id):
         """Block a contact. Silent — no notification, just denies access."""
         self.update_contact_role(str(contact_id), role="blocked")
+
+    # =========================================================================
+    # Productivity: Shared Lists (003)
+    # =========================================================================
+
+    def create_shared_list(
+        self, *, list_id, name, list_type="shopping", created_by,
+    ):
+        def _do(conn):
+            now = time.time()
+            conn.execute(
+                """INSERT INTO shared_lists
+                   (list_id, name, list_type, status, created_by,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, 'active', ?, ?, ?)""",
+                (list_id, name, str(list_type), str(created_by), now, now),
+            )
+        self._execute_write(_do)
+
+    def get_shared_list(self, list_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM shared_lists WHERE list_id = ?", (list_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def find_shared_list_by_name(self, name):
+        """Case-insensitive name match on active lists. Returns first match."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM shared_lists WHERE LOWER(name) = LOWER(?) AND status = 'active'",
+                (name,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_shared_lists(self, *, status="active"):
+        with self._lock:
+            if status:
+                rows = self._conn.execute(
+                    "SELECT * FROM shared_lists WHERE status = ? ORDER BY created_at",
+                    (str(status),),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM shared_lists ORDER BY created_at"
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def archive_shared_list(self, list_id):
+        def _do(conn):
+            conn.execute(
+                "UPDATE shared_lists SET status = 'archived', updated_at = ? WHERE list_id = ?",
+                (time.time(), list_id),
+            )
+        self._execute_write(_do)
+
+    # ----- List Items -----
+
+    def create_list_item(
+        self, *, item_id, list_id, content, added_by, added_by_name=None,
+    ):
+        def _do(conn):
+            now = time.time()
+            conn.execute(
+                """INSERT INTO list_items
+                   (item_id, list_id, content, checked, added_by,
+                    added_by_name, created_at)
+                   VALUES (?, ?, ?, 0, ?, ?, ?)""",
+                (item_id, list_id, content, str(added_by),
+                 added_by_name, now),
+            )
+            # Bump parent list updated_at
+            conn.execute(
+                "UPDATE shared_lists SET updated_at = ? WHERE list_id = ?",
+                (now, list_id),
+            )
+        self._execute_write(_do)
+
+    def get_list_items(self, list_id, *, include_checked=False):
+        with self._lock:
+            if include_checked:
+                rows = self._conn.execute(
+                    "SELECT * FROM list_items WHERE list_id = ? ORDER BY created_at",
+                    (list_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM list_items WHERE list_id = ? AND checked = 0 ORDER BY created_at",
+                    (list_id,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_list_item(self, item_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM list_items WHERE item_id = ?", (item_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_list_item_checked(self, item_id, *, checked, checked_by=None):
+        def _do(conn):
+            if checked:
+                conn.execute(
+                    """UPDATE list_items
+                       SET checked = 1, checked_by = ?, checked_at = ?
+                       WHERE item_id = ?""",
+                    (checked_by, time.time(), item_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE list_items
+                       SET checked = 0, checked_by = NULL, checked_at = NULL
+                       WHERE item_id = ?""",
+                    (item_id,),
+                )
+        self._execute_write(_do)
+
+    def delete_list_item(self, item_id):
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM list_items WHERE item_id = ?", (item_id,),
+            )
+        self._execute_write(_do)

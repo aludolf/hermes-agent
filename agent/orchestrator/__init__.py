@@ -5,6 +5,7 @@ general orchestrator initiative.
 """
 
 from .contacts import ContactManager
+from .lists import ListManager
 from .models import (
     ActionStatus,
     ApprovalStatus,
@@ -16,6 +17,8 @@ from .models import (
     ContactRole,
     JobStatus,
     KnowledgeTier,
+    ListStatus,
+    ListType,
     NormalizedArtifact,
     RouteClass,
     RouteDecision,
@@ -52,6 +55,9 @@ __all__ = [
     "ContactRole",
     "JobStatus",
     "KnowledgeTier",
+    "ListManager",
+    "ListStatus",
+    "ListType",
     "LocalStorageAdapter",
     "NormalizedArtifact",
     "OrchestratorJobService",

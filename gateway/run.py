@@ -623,6 +623,7 @@ class GatewayRunner:
         # Contact manager (003 — productivity orchestrator)
         # Auto-registers the owner from HERMES_OWNER_TELEGRAM_ID on startup.
         self._contact_manager = None
+        self._list_manager = None
         if self._session_db is not None:
             try:
                 from agent.orchestrator.contacts import ContactManager
@@ -633,6 +634,15 @@ class GatewayRunner:
                     logger.info("Contact manager ready, owner=%s", owner_id)
             except Exception as e:
                 logger.warning("Contact manager init failed: %s", e)
+
+            try:
+                from agent.orchestrator.lists import ListManager
+                self._list_manager = ListManager(self._session_db)
+                created = self._list_manager.seed_default_lists(created_by="system")
+                if created:
+                    logger.info("Seeded %d default lists", len(created))
+            except Exception as e:
+                logger.warning("List manager init failed: %s", e)
 
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
@@ -2666,6 +2676,164 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    async def _handle_contact_list_intent(self, event: "MessageEvent") -> Optional[str]:
+        """Try to handle a contact's message as a list operation (no LLM).
+
+        Returns a response string if the message matches a simple list intent
+        (add item, show list, etc.), or None to fall through to the LLM.
+
+        All responses in Portuguese. Also notifies the owner when items are
+        added by contacts.
+        """
+        if not self._list_manager or not self._contact_manager:
+            return None
+
+        text = (getattr(event, "text", "") or "").strip()
+        if not text:
+            return None
+
+        source = event.source
+        contact_rec = self._contact_manager.get_role(source.user_id)
+        if contact_rec is None:
+            return None
+
+        caps = self._contact_manager.get_capabilities(source.user_id)
+        if "lists" not in caps and "all" not in caps:
+            return None
+
+        contact_name = contact_rec.get("display_name") or source.user_name or "?"
+        lowered = text.lower()
+
+        # ---- Intent: show all lists ----
+        if lowered in (
+            "listas", "quais listas", "quais são as listas",
+            "o que temos nas listas", "mostra as listas", "mostrar listas",
+        ):
+            return self._list_manager.format_all_lists_summary()
+
+        # ---- Intent: show a specific list ----
+        import re
+        show_patterns = [
+            r"^(?:mostra|mostrar|me mostra|ver|o que tem na|o que tem em|conteúdo da|conteudo da)\s+(?:lista\s+)?(.+?)\??$",
+            r"^lista\s+(.+?)\??$",
+        ]
+        for pat in show_patterns:
+            m = re.match(pat, lowered)
+            if m:
+                name_raw = m.group(1).strip()
+                list_rec = self._list_manager.find_list_by_name(name_raw)
+                if list_rec:
+                    return self._list_manager.format_list_summary(list_rec["list_id"])
+
+        # ---- Intent: add item ----
+        # Patterns we catch (Portuguese):
+        #  "preciso de X"
+        #  "precisamos de X"
+        #  "adiciona X [na|à|para] lista [de] Y"
+        #  "adiciona X"
+        #  "falta X"
+        #  "não tem mais X"
+        #  "acabou X"
+        #  "coloca X na lista [Y]"
+        add_patterns = [
+            (r"^preciso de (.+?)\.?$", None),
+            (r"^precisamos de (.+?)\.?$", None),
+            (r"^falta (.+?)\.?$", None),
+            (r"^faltou (.+?)\.?$", None),
+            (r"^não tem mais (.+?)\.?$", None),
+            (r"^nao tem mais (.+?)\.?$", None),
+            (r"^acabou (?:o |a )?(.+?)\.?$", None),
+            (r"^adiciona (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
+            (r"^adicionar (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
+            (r"^coloca (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
+            (r"^põe (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
+            (r"^adiciona (.+?)\.?$", None),
+            (r"^adicionar (.+?)\.?$", None),
+            (r"^coloca (.+?)(?: na lista)?\.?$", None),
+        ]
+
+        for pat, kind in add_patterns:
+            m = re.match(pat, lowered)
+            if not m:
+                continue
+
+            if kind == "with_list":
+                item_text = m.group(1).strip()
+                target_list = m.group(2).strip()
+                list_rec = self._list_manager.find_list_by_name(target_list)
+                if list_rec is None:
+                    return (
+                        f"Não encontrei a lista **{target_list}**. "
+                        f"Use `listas` para ver as listas disponíveis."
+                    )
+            else:
+                item_text = m.group(1).strip()
+                # Default to the shopping list (Compras)
+                list_rec = self._list_manager.find_list_by_name("Compras")
+                if list_rec is None:
+                    # Fallback: first active list
+                    all_lists = self._list_manager.list_all()
+                    if not all_lists:
+                        return "Nenhuma lista disponível. Peça ao administrador para criar uma."
+                    list_rec = all_lists[0]
+
+            if not item_text or len(item_text) > 200:
+                return None  # fall through to LLM
+
+            # Preserve original-case item text from the raw message
+            # Find the same substring in the original text
+            orig_match = re.search(re.escape(item_text), text, re.IGNORECASE)
+            if orig_match:
+                item_text_cased = orig_match.group(0)
+            else:
+                item_text_cased = item_text
+
+            self._list_manager.add_item(
+                list_rec["list_id"],
+                content=item_text_cased,
+                added_by=str(source.user_id),
+                added_by_name=contact_name,
+            )
+
+            # Notify the owner (T028)
+            try:
+                await self._notify_owner_list_update(
+                    contact_name=contact_name,
+                    list_name=list_rec["name"],
+                    item=item_text_cased,
+                )
+            except Exception as e:
+                logger.debug("owner list notify failed: %s", e)
+
+            return (
+                f"✅ Adicionei **{item_text_cased}** à lista **{list_rec['name']}**. "
+                f"Já avisei o administrador."
+            )
+
+        return None  # fall through to LLM
+
+    async def _notify_owner_list_update(
+        self, *, contact_name: str, list_name: str, item: str,
+    ) -> None:
+        """DM the owner when a contact adds an item to a shared list."""
+        owner_id = os.getenv("HERMES_OWNER_TELEGRAM_ID", "").strip()
+        if not owner_id:
+            return
+
+        from gateway.platforms.base import Platform
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        if adapter is None:
+            return
+
+        msg = (
+            f"🛒 **{contact_name}** adicionou à lista **{list_name}**:\n\n"
+            f"• {item}"
+        )
+        try:
+            await adapter.send(str(owner_id), msg)
+        except Exception as e:
+            logger.warning("Failed to notify owner of list update: %s", e)
+
     async def _notify_owner_pending_contact(self, source) -> None:
         """DM the owner that a new contact is pending approval."""
         owner_id = os.getenv("HERMES_OWNER_TELEGRAM_ID", "").strip()
@@ -2831,6 +2999,20 @@ class GatewayRunner:
                 _contact_role_allowed = True
                 _contact_role_is_contact = (role == "contact")
 
+                # For contacts, try deterministic NL list intent BEFORE
+                # spawning an LLM session. Cheap, fast, no token burn.
+                if _contact_role_is_contact and not (event.text or "").startswith("/"):
+                    try:
+                        _list_reply = await self._handle_contact_list_intent(event)
+                    except Exception as _e:
+                        logger.debug("contact list intent failed: %s", _e)
+                        _list_reply = None
+                    if _list_reply is not None:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(source.chat_id, _list_reply)
+                        return None
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         if getattr(event, "internal", False):
@@ -2985,6 +3167,12 @@ class GatewayRunner:
                 return await self._handle_block_contact_command(event)
             if event.get_command() == "contacts":
                 return await self._handle_contacts_command(event)
+            if event.get_command() == "lists":
+                return await self._handle_lists_command(event)
+            if event.get_command() == "list":
+                return await self._handle_list_command(event)
+            if event.get_command() == "newlist":
+                return await self._handle_newlist_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3156,6 +3344,12 @@ class GatewayRunner:
             return await self._handle_block_contact_command(event)
         if canonical == "contacts":
             return await self._handle_contacts_command(event)
+        if canonical == "lists":
+            return await self._handle_lists_command(event)
+        if canonical == "list":
+            return await self._handle_list_command(event)
+        if canonical == "newlist":
+            return await self._handle_newlist_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -5050,6 +5244,77 @@ class GatewayRunner:
             lines.append("")
 
         return "\n".join(lines).strip()
+
+    async def _handle_lists_command(self, event: MessageEvent) -> str:
+        """Handle /lists — show all active shared lists with counts."""
+        if not self._list_manager:
+            return "Gerenciador de listas não disponível."
+        source = event.source
+        if self._contact_manager and not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode ver todas as listas."
+        return self._list_manager.format_all_lists_summary()
+
+    async def _handle_list_command(self, event: MessageEvent) -> str:
+        """Handle /list <name> — show items in a specific list."""
+        if not self._list_manager:
+            return "Gerenciador de listas não disponível."
+
+        args = event.get_command_args().strip()
+        if not args:
+            return "Uso: `/list <nome>` (ex: `/list Compras`)"
+
+        list_rec = self._list_manager.find_list_by_name(args)
+        if list_rec is None:
+            return f"Lista `{args}` não encontrada. Use `/lists` para ver as listas disponíveis."
+
+        return self._list_manager.format_list_summary(list_rec["list_id"])
+
+    async def _handle_newlist_command(self, event: MessageEvent) -> str:
+        """Handle /newlist <name> [type] — create a new shared list. Owner only."""
+        if not self._list_manager:
+            return "Gerenciador de listas não disponível."
+
+        source = event.source
+        if self._contact_manager and not self._contact_manager.is_owner(source.user_id):
+            return "❌ Apenas o administrador pode criar listas."
+
+        args = event.get_command_args().strip().split(maxsplit=1)
+        if not args:
+            return (
+                "Uso: `/newlist <nome> [tipo]`\n\n"
+                "Tipos: `shopping`, `school`, `repairs`, `errands`, `custom`\n"
+                "Padrão: `custom`\n\n"
+                "Exemplo: `/newlist Farmácia shopping`"
+            )
+
+        # Parse: first token is name (may include multiple words if quoted?)
+        # For simplicity: if 2 tokens and 2nd is a valid type, treat 2nd as type
+        from agent.orchestrator.models import ListType
+        valid_types = {t.value for t in ListType}
+
+        name = args[0]
+        list_type = "custom"
+        if len(args) > 1:
+            potential_type = args[1].strip().lower()
+            if potential_type in valid_types:
+                list_type = potential_type
+            else:
+                # Treat the whole thing as a multi-word name
+                name = f"{args[0]} {args[1]}".strip()
+
+        existing = self._list_manager.find_list_by_name(name)
+        if existing:
+            return f"Lista `{name}` já existe."
+
+        rec = self._list_manager.create_list(
+            name=name,
+            list_type=list_type,
+            created_by=str(source.user_id),
+        )
+        return (
+            f"✅ Lista criada: **{rec['name']}** (tipo: `{rec['list_type']}`)\n\n"
+            f"Use `/list {rec['name']}` para ver os itens."
+        )
 
     async def _handle_restart_command(self, event: MessageEvent) -> str:
         """Handle /restart command - drain active work, then restart the gateway."""
