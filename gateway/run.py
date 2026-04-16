@@ -2774,20 +2774,29 @@ class GatewayRunner:
         #  "acabou X"
         #  "coloca X na lista [Y]"
         add_patterns = [
+            # "preciso de X", "precisamos de X"
             (r"^preciso de (.+?)\.?$", None),
             (r"^precisamos de (.+?)\.?$", None),
+            # "preciso comprar X", "preciso X"
+            (r"^preciso (?:comprar |de )?(.+?)\.?$", None),
+            (r"^precisamos (?:comprar |de )?(.+?)\.?$", None),
+            # "comprar X", "compra X"
+            (r"^(?:comprar|compra) (.+?)\.?$", None),
+            (r"^(?:quero|queria|queremos) (?:comprar )?(.+?)\.?$", None),
+            # "falta X", "faltou X", "acabou X"
             (r"^falta (.+?)\.?$", None),
             (r"^faltou (.+?)\.?$", None),
             (r"^não tem mais (.+?)\.?$", None),
             (r"^nao tem mais (.+?)\.?$", None),
-            (r"^acabou (?:o |a )?(.+?)\.?$", None),
-            (r"^adiciona (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
-            (r"^adicionar (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
-            (r"^coloca (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
-            (r"^põe (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
-            (r"^adiciona (.+?)\.?$", None),
-            (r"^adicionar (.+?)\.?$", None),
-            (r"^coloca (.+?)(?: na lista)?\.?$", None),
+            (r"^acabou (?:o |a |os |as )?(.+?)\.?$", None),
+            (r"^tá faltando (.+?)\.?$", None),
+            (r"^ta faltando (.+?)\.?$", None),
+            # "tem que comprar X", "tem que pegar X"
+            (r"^tem que (?:comprar|pegar|trazer|buscar) (.+?)\.?$", None),
+            # Explicit list targeting: "adiciona X na lista Y"
+            (r"^(?:adiciona|adicionar|coloca|colocar|põe|bota) (.+?) (?:na|à|ao|para a?) lista (?:de )?(.+?)\.?$", "with_list"),
+            # Simple add: "adiciona X", "coloca X"
+            (r"^(?:adiciona|adicionar|coloca|colocar|põe|bota) (.+?)\.?$", None),
         ]
 
         for pat, kind in add_patterns:
@@ -2865,6 +2874,58 @@ class GatewayRunner:
                 f"✅ Adicionei **{item_text_cased}** à lista **{list_rec['name']}**. "
                 f"Já avisei o administrador."
             )
+
+        # Catch-all: short messages from contacts that look like item names
+        # (not questions, not greetings) → assume it's a list add to Compras.
+        # This handles "shampoo e condicionador", "papel higiênico", etc.
+        _greetings = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite",
+                       "obrigado", "obrigada", "valeu", "tchau", "sim", "não",
+                       "ok", "tudo bem", "beleza", "brigado", "brigada"}
+        if (
+            len(lowered) < 80
+            and "?" not in text
+            and lowered not in _greetings
+            and not any(lowered.startswith(g) for g in _greetings)
+        ):
+            list_rec = self._list_manager.find_list_by_name("Compras")
+            if list_rec:
+                try:
+                    self._list_manager.add_item(
+                        list_rec["list_id"],
+                        content=text.strip(),  # preserve original casing
+                        added_by=str(source.user_id),
+                        added_by_name=contact_name,
+                    )
+                except ValueError:
+                    return None  # fall through to LLM on validation error
+
+                try:
+                    await self._notify_owner_list_update(
+                        contact_name=contact_name,
+                        list_name=list_rec["name"],
+                        item=text.strip(),
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    from agent.orchestrator.jobs import OrchestratorJobService
+                    if self._session_db:
+                        svc = OrchestratorJobService(self._session_db)
+                        svc.track_productivity_event(
+                            event_type="list_update",
+                            title=f"{contact_name} → {list_rec['name']}: {text.strip()}",
+                            content=text.strip(),
+                            triggered_by=str(source.user_id),
+                            metadata={"list_name": list_rec["name"], "item": text.strip()},
+                        )
+                except Exception:
+                    pass
+
+                return (
+                    f"✅ Adicionei **{text.strip()}** à lista **{list_rec['name']}**. "
+                    f"Já avisei o administrador."
+                )
 
         return None  # fall through to LLM
 
@@ -9455,8 +9516,12 @@ class GatewayRunner:
                             _productivity_prompt = (
                                 f"Você é o Hermes, assistente doméstico. Responda sempre em português do Brasil. "
                                 f"Este contato ({_role_rec.get('display_name', '')}) tem permissão apenas para: {_caps_str}. "
-                                f"Quando o contato pedir para adicionar itens a uma lista, adicione e confirme em português. "
-                                f"Você NÃO deve dar acesso a: agenda, email, lembretes pessoais, ou configurações do sistema. "
+                                f"\n\nREGRA PRINCIPAL: Quando o contato mencionar QUALQUER produto, item, material ou "
+                                f"coisa que precisa comprar/pegar/trazer, SEMPRE interprete como um pedido para "
+                                f"adicionar à lista de Compras. Exemplos: 'shampoo e condicionador' = adicionar "
+                                f"shampoo e condicionador à lista. 'comprar leite' = adicionar leite. "
+                                f"'preciso de café' = adicionar café. Confirme em português o que foi adicionado."
+                                f"\n\nVocê NÃO deve dar acesso a: agenda, email, lembretes pessoais, ou configurações do sistema. "
                                 f"Se o contato pedir algo fora das permissões, diga gentilmente que não pode ajudar com isso "
                                 f"e ofereça encaminhar a solicitação ao administrador."
                             )
