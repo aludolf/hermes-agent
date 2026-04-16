@@ -2766,6 +2766,7 @@ class GatewayRunner:
                 list_manager=self._list_manager,
                 calendar_bridge=self._calendar_bridge,
                 reminder_service=self._reminder_service,
+                chat_id=str(source.chat_id) if source.chat_id else None,
             )
         except Exception as e:
             logger.warning("voice extraction pipeline error: %s", e)
@@ -2777,6 +2778,142 @@ class GatewayRunner:
             "voice extraction intercepted: ext=%s actions=%d",
             outcome.extraction_id, len(outcome.routed),
         )
+        return outcome.reply_text
+
+    async def _maybe_handle_preview_confirmation(
+        self,
+        *,
+        event: "MessageEvent",
+        source: "SessionSource",
+    ) -> Optional[str]:
+        """Resolve an active PendingPreview reply (021 US3).
+
+        Catches "confirmar" / "confirmar N, M" / "cancelar" (Portuguese,
+        case-insensitive) when the sender has an active PendingPreview.
+        Returns the reply to send on match, None to fall through.
+        """
+        if self._session_db is None or self._contact_manager is None:
+            return None
+        if source.user_id is None or source.platform is None:
+            return None
+        if source.platform.value != "telegram":
+            return None
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or len(text) > 200:
+            return None  # keep scope tight — long text is never a confirm reply
+
+        from agent.orchestrator.pending_preview import (
+            PendingPreviewManager,
+            parse_preview_reply,
+        )
+        from agent.orchestrator.action_router import RoutedHandlers
+
+        parsed = parse_preview_reply(text)
+        if parsed.kind == "unknown":
+            return None
+
+        mgr = PendingPreviewManager(self._session_db)
+        preview = mgr.get_active_preview(str(source.user_id))
+        if preview is None:
+            return None  # nothing pending — don't swallow a normal message
+
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+        handlers = RoutedHandlers(
+            list_manager=self._list_manager,
+            calendar_bridge=self._calendar_bridge,
+            reminder_service=self._reminder_service,
+        )
+
+        if parsed.kind == "cancel":
+            outcome = mgr.cancel(sender_id=str(source.user_id))
+        elif parsed.kind == "confirm_all":
+            outcome = mgr.confirm_all(
+                sender_id=str(source.user_id),
+                sender_capabilities=capabilities,
+                handlers=handlers,
+                sender_name=source.user_name,
+            )
+        elif parsed.kind == "confirm_subset":
+            outcome = mgr.confirm_subset(
+                sender_id=str(source.user_id),
+                indices=parsed.indices or [],
+                sender_capabilities=capabilities,
+                handlers=handlers,
+                sender_name=source.user_name,
+            )
+        else:  # pragma: no cover — defensive
+            return None
+
+        logger.info(
+            "preview confirmation handled: sender=%s status=%s",
+            source.user_id, outcome.status,
+        )
+        return outcome.reply_text
+
+    async def _handle_transcript_command(self, event: "MessageEvent") -> str:
+        """Handle /transcript — force-preview extraction for pasted text (021 US3).
+
+        Two invocation styles:
+        - `/transcript <text>`: the command arg is the transcript body.
+        - `/transcript` while replying to a message: use the replied-to text.
+
+        Always treats the input as long (force_preview=True) so the user sees
+        a numbered preview before anything executes. Owner-only.
+        """
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        rec = self._contact_manager.get_role(source.user_id)
+        if rec is None or rec.get("role") != "owner":
+            return "Somente o administrador pode usar /transcript."
+
+        # Extract the text body — from command args or reply-to.
+        raw = (getattr(event, "text", "") or "").strip()
+        body = ""
+        if raw.startswith("/"):
+            # Strip "/transcript" prefix
+            parts = raw.split(None, 1)
+            body = parts[1].strip() if len(parts) > 1 else ""
+
+        # Fall back to the replied-to message if args empty.
+        if not body:
+            reply_to = getattr(event, "reply_to_text", None) or getattr(event, "reply_to_message", None)
+            if isinstance(reply_to, str):
+                body = reply_to.strip()
+            elif reply_to is not None:
+                body = str(getattr(reply_to, "text", "") or "").strip()
+
+        if not body:
+            return (
+                "Uso: `/transcript <texto>` ou responda a uma mensagem com `/transcript`.\n\n"
+                "Exemplo: `/transcript reunião do dia 20 às 10h com João...`"
+            )
+
+        from agent.orchestrator.voice_note_pipeline import perform_extraction
+
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+        try:
+            outcome = await perform_extraction(
+                transcript=body,
+                sender_id=str(source.user_id),
+                sender_role="owner",
+                sender_capabilities=capabilities,
+                sender_name=source.user_name,
+                source_type="pasted_text",
+                source_format="md",
+                session_db=self._session_db,
+                list_manager=self._list_manager,
+                calendar_bridge=self._calendar_bridge,
+                reminder_service=self._reminder_service,
+                chat_id=str(source.chat_id) if source.chat_id else None,
+                force_preview=True,
+            )
+        except Exception as e:
+            logger.warning("/transcript pipeline error: %s", e)
+            return "⚠️ Não foi possível processar a transcrição."
+
+        if outcome is None:
+            return "Nenhuma ação clara foi detectada na transcrição."
         return outcome.reply_text
 
     async def _maybe_intercept_document_extraction(
@@ -2848,6 +2985,7 @@ class GatewayRunner:
                 list_manager=self._list_manager,
                 calendar_bridge=self._calendar_bridge,
                 reminder_service=self._reminder_service,
+                chat_id=str(source.chat_id) if source.chat_id else None,
             )
         except Exception as e:
             logger.warning("document extraction pipeline error: %s", e)
@@ -3331,6 +3469,24 @@ class GatewayRunner:
                 _contact_role_allowed = True
                 _contact_role_is_contact = (role == "contact")
 
+                # 021 US3: preview-confirmation reply handler. Catches
+                # "confirmar" / "confirmar N, M" / "cancelar" from any owner
+                # or contact with an active PendingPreview. Runs BEFORE the
+                # contact list intent so it isn't misclassified as a list op.
+                if not (event.text or "").startswith("/"):
+                    try:
+                        _preview_reply = await self._maybe_handle_preview_confirmation(
+                            event=event, source=source,
+                        )
+                    except Exception as _e:
+                        logger.debug("preview confirmation failed: %s", _e)
+                        _preview_reply = None
+                    if _preview_reply is not None:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(source.chat_id, _preview_reply)
+                        return None
+
                 # For contacts, try deterministic NL list intent BEFORE
                 # spawning an LLM session. Cheap, fast, no token burn.
                 if _contact_role_is_contact and not (event.text or "").startswith("/"):
@@ -3517,6 +3673,8 @@ class GatewayRunner:
                 return await self._handle_done_command(event)
             if event.get_command() == "recados":
                 return await self._handle_recados_command(event)
+            if event.get_command() == "transcript":
+                return await self._handle_transcript_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3706,6 +3864,8 @@ class GatewayRunner:
             return await self._handle_done_command(event)
         if canonical == "recados":
             return await self._handle_recados_command(event)
+        if canonical == "transcript":
+            return await self._handle_transcript_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)

@@ -35,6 +35,7 @@ from .extraction import (
     compute_transcript_hash,
     extract_actions,
 )
+from .pending_preview import PendingPreviewManager
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ async def perform_extraction(
     list_manager: Any | None = None,
     calendar_bridge: Any | None = None,
     reminder_service: Any | None = None,
+    chat_id: str | None = None,
     current_date: date | None = None,
     force_preview: bool = False,
     extract_fn: Callable[..., ExtractionResult | None] | None = None,
@@ -275,9 +277,21 @@ async def perform_extraction(
     if long_input:
         preview_id = new_preview_id()
         reply = format_preview_response(result, routed)
-        # Caller (gateway) is responsible for passing chat_id when creating
-        # the preview record, since chat binding is platform state. The
-        # pipeline simply allocates the preview_id so the caller can wire it.
+        # Persist the PendingPreview when we have a session_db + chat_id.
+        # The gateway passes chat_id from the platform event; pure-function
+        # callers (tests) may omit it and do their own persistence.
+        if session_db is not None and chat_id is not None:
+            try:
+                mgr = PendingPreviewManager(session_db)
+                mgr.create_preview(
+                    preview_id=preview_id,
+                    extraction_id=extraction_id,
+                    sender_id=sender_id,
+                    chat_id=chat_id,
+                    routed=routed,
+                )
+            except Exception as e:
+                logger.warning("pipeline: preview persist failed: %s", e)
         return PipelineOutcome(
             reply_text=reply,
             extraction_id=extraction_id,

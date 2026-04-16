@@ -263,6 +263,56 @@ def test_pipeline_rejects_unknown_sender_role(tmp_path):
         db.close()
 
 
+def test_pipeline_long_input_persists_pending_preview(tmp_path):
+    """US3: long transcript + chat_id → pending_previews row created."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    lm, cal, rem = _fake_handlers()
+    try:
+        outcome = _run(perform_extraction(
+            transcript="a" * 2100,
+            sender_id="owner",
+            sender_role="owner",
+            sender_capabilities={"all"},
+            chat_id="chat_42",
+            session_db=db,
+            list_manager=lm, calendar_bridge=cal, reminder_service=rem,
+            extract_fn=_fake_extract_factory(_task_result(0.95)),
+        ))
+        assert outcome is not None
+        assert outcome.preview_id is not None
+
+        # An active preview row should exist for the sender.
+        active = db.get_active_preview_by_sender("owner")
+        assert active is not None
+        assert active["preview_id"] == outcome.preview_id
+        assert active["chat_id"] == "chat_42"
+    finally:
+        db.close()
+
+
+def test_pipeline_force_preview_without_chat_id_skips_persist(tmp_path):
+    """Tests can call pipeline without chat_id; no DB row but preview_id set."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    lm, cal, rem = _fake_handlers()
+    try:
+        outcome = _run(perform_extraction(
+            transcript="whatever",
+            sender_id="owner",
+            sender_role="owner",
+            sender_capabilities={"all"},
+            session_db=db,
+            list_manager=lm, calendar_bridge=cal, reminder_service=rem,
+            force_preview=True,
+            extract_fn=_fake_extract_factory(_task_result(0.95)),
+        ))
+        assert outcome is not None
+        assert outcome.execution_mode == "preview"
+        # No preview row because chat_id wasn't provided.
+        assert db.get_active_preview_by_sender("owner") is None
+    finally:
+        db.close()
+
+
 def test_pipeline_document_source_type_is_recorded(tmp_path):
     """US2: a document_upload pipeline run persists source_type correctly."""
     db = SessionDB(db_path=tmp_path / "state.db")

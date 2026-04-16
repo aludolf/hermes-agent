@@ -29,6 +29,12 @@ from .extraction import (
 )
 from .extraction_prompts import build_extraction_system_prompt
 from .lists import ListManager
+from .pending_preview import (
+    ConfirmationResult,
+    ParsedReply,
+    PendingPreviewManager,
+    parse_preview_reply,
+)
 from .reminders import ReminderService
 from .models import (
     ActionStatus,
@@ -87,6 +93,7 @@ __all__ = [
     "CalendarBridge",
     "CandidateState",
     "Capability",
+    "ConfirmationResult",
     "ConsumptionMode",
     "ContactManager",
     "ContactRole",
@@ -106,6 +113,8 @@ __all__ = [
     "MatchType",
     "NormalizedArtifact",
     "OrchestratorJobService",
+    "ParsedReply",
+    "PendingPreviewManager",
     "PreviewStatus",
     "RAW_STORAGE_BUCKETS",
     "ReminderService",
@@ -141,5 +150,6 @@ __all__ = [
     "new_extraction_id",
     "new_preview_id",
     "parse_portuguese_datetime",
+    "parse_preview_reply",
     "route_actions",
 ]
