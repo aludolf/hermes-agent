@@ -2763,6 +2763,25 @@ class GatewayRunner:
                 if list_rec:
                     return self._list_manager.format_list_summary(list_rec["list_id"])
 
+        # ---- Intent: complete item ----
+        # "já comprei X", "já fiz X", "pronto o X", "feito o X"
+        complete_patterns = [
+            r"^já (?:comprei|peguei|trouxe|busquei|fiz) (?:o |a |os |as )?(.+?)\.?$",
+            r"^ja (?:comprei|peguei|trouxe|busquei|fiz) (?:o |a |os |as )?(.+?)\.?$",
+            r"^(?:pronto|feito|concluído|concluido) (?:o |a |os |as )?(.+?)\.?$",
+            r"^(?:comprei|peguei|trouxe|fiz) (?:o |a |os |as )?(.+?)\.?$",
+        ]
+        for pat in complete_patterns:
+            m = re.match(pat, lowered)
+            if m:
+                item_text = m.group(1).strip()
+                result = self._list_manager.check_item_by_text(
+                    item_text, checked_by=str(source.user_id),
+                )
+                if result:
+                    return f"✅ Marcado como feito: **{result['content']}** ({result['list_name']})"
+                return f"Não encontrei '{item_text}' nas listas ativas."
+
         # ---- Intent: add item ----
         # Patterns we catch (Portuguese):
         #  "preciso de X"
@@ -2875,59 +2894,92 @@ class GatewayRunner:
                 f"Já avisei o administrador."
             )
 
-        # Catch-all: short messages from contacts that look like item names
-        # (not questions, not greetings) → assume it's a list add to Compras.
-        # This handles "shampoo e condicionador", "papel higiênico", etc.
-        _greetings = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite",
-                       "obrigado", "obrigada", "valeu", "tchau", "sim", "não",
-                       "ok", "tudo bem", "beleza", "brigado", "brigada"}
-        if (
-            len(lowered) < 80
-            and "?" not in text
-            and lowered not in _greetings
-            and not any(lowered.startswith(g) for g in _greetings)
-        ):
-            list_rec = self._list_manager.find_list_by_name("Compras")
-            if list_rec:
-                try:
-                    self._list_manager.add_item(
-                        list_rec["list_id"],
-                        content=text.strip(),  # preserve original casing
-                        added_by=str(source.user_id),
-                        added_by_name=contact_name,
-                    )
-                except ValueError:
-                    return None  # fall through to LLM on validation error
+        # -- LLM intent classifier fallback (Haiku, ~$0.001) --
+        # Regex didn't match. Use Haiku to classify the intent before
+        # burning a full Sonnet session. Handles "shampoo e condicionador",
+        # "já comprei o leite", "o que tem na lista de reparos?", etc.
+        try:
+            from agent.orchestrator.intent_classifier import classify_contact_message
+            classified = classify_contact_message(text)
+        except Exception as _e:
+            logger.debug("intent classifier failed: %s", _e)
+            classified = None
 
-                try:
-                    await self._notify_owner_list_update(
-                        contact_name=contact_name,
-                        list_name=list_rec["name"],
-                        item=text.strip(),
-                    )
-                except Exception:
-                    pass
+        if classified and classified.confidence >= 0.7:
+            if classified.intent == "add_item" and classified.items:
+                target_name = classified.target_list or "Compras"
+                list_rec = self._list_manager.find_list_by_name(target_name)
+                if list_rec is None:
+                    list_rec = self._list_manager.find_list_by_name("Compras")
+                if list_rec:
+                    added_items = []
+                    for item_text in classified.items:
+                        item_text = item_text.strip()
+                        if not item_text:
+                            continue
+                        try:
+                            self._list_manager.add_item(
+                                list_rec["list_id"],
+                                content=item_text,
+                                added_by=str(source.user_id),
+                                added_by_name=contact_name,
+                            )
+                            added_items.append(item_text)
+                        except ValueError:
+                            continue
 
-                try:
-                    from agent.orchestrator.jobs import OrchestratorJobService
-                    if self._session_db:
-                        svc = OrchestratorJobService(self._session_db)
-                        svc.track_productivity_event(
-                            event_type="list_update",
-                            title=f"{contact_name} → {list_rec['name']}: {text.strip()}",
-                            content=text.strip(),
-                            triggered_by=str(source.user_id),
-                            metadata={"list_name": list_rec["name"], "item": text.strip()},
+                    if added_items:
+                        items_str = ", ".join(f"**{i}**" for i in added_items)
+                        try:
+                            await self._notify_owner_list_update(
+                                contact_name=contact_name,
+                                list_name=list_rec["name"],
+                                item=", ".join(added_items),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            from agent.orchestrator.jobs import OrchestratorJobService
+                            if self._session_db:
+                                svc = OrchestratorJobService(self._session_db)
+                                svc.track_productivity_event(
+                                    event_type="list_update",
+                                    title=f"{contact_name} → {list_rec['name']}: {', '.join(added_items)}",
+                                    content=", ".join(added_items),
+                                    triggered_by=str(source.user_id),
+                                    metadata={"list_name": list_rec["name"], "items": added_items},
+                                )
+                        except Exception:
+                            pass
+                        return (
+                            f"✅ Adicionei {items_str} à lista **{list_rec['name']}**. "
+                            f"Já avisei o administrador."
                         )
-                except Exception:
-                    pass
 
-                return (
-                    f"✅ Adicionei **{text.strip()}** à lista **{list_rec['name']}**. "
-                    f"Já avisei o administrador."
-                )
+            elif classified.intent == "complete_item" and classified.items:
+                checked = []
+                for item_text in classified.items:
+                    result = self._list_manager.check_item_by_text(
+                        item_text.strip(), checked_by=str(source.user_id),
+                    )
+                    if result:
+                        checked.append(f"**{result['content']}** ({result['list_name']})")
+                if checked:
+                    return f"✅ Marcado como feito: {', '.join(checked)}"
+                return f"Não encontrei '{', '.join(classified.items)}' nas listas."
 
-        return None  # fall through to LLM
+            elif classified.intent == "show_list":
+                target_name = classified.target_list
+                if target_name:
+                    list_rec = self._list_manager.find_list_by_name(target_name)
+                    if list_rec:
+                        return self._list_manager.format_list_summary(list_rec["list_id"])
+                return self._list_manager.format_all_lists_summary()
+
+            elif classified.intent == "greeting":
+                return "Olá! 😊 Como posso ajudar? Pode me dizer o que precisa e eu adiciono na lista."
+
+        return None  # fall through to LLM for complex/ambiguous messages
 
     async def _notify_owner_list_update(
         self, *, contact_name: str, list_name: str, item: str,
@@ -3298,6 +3350,10 @@ class GatewayRunner:
                 return await self._handle_calendar_command(event)
             if event.get_command() == "briefing":
                 return await self._handle_briefing_command(event)
+            if event.get_command() == "done":
+                return await self._handle_done_command(event)
+            if event.get_command() == "recados":
+                return await self._handle_recados_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3483,6 +3539,10 @@ class GatewayRunner:
             return await self._handle_calendar_command(event)
         if canonical == "briefing":
             return await self._handle_briefing_command(event)
+        if canonical == "done":
+            return await self._handle_done_command(event)
+        if canonical == "recados":
+            return await self._handle_recados_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -5545,6 +5605,43 @@ class GatewayRunner:
 
         # Default: today
         return self._calendar_bridge.format_today_summary()
+
+    async def _handle_done_command(self, event: MessageEvent) -> str:
+        """Handle /done <item text> — fuzzy match and check off across all lists."""
+        if not self._list_manager:
+            return "Gerenciador de listas não disponível."
+
+        args = event.get_command_args().strip()
+        if not args:
+            return (
+                "Uso: `/done <item>`\n\n"
+                "Marca um item como feito/comprado em qualquer lista.\n"
+                "Exemplo: `/done leite`"
+            )
+
+        source = event.source
+        result = self._list_manager.check_item_by_text(
+            args, checked_by=str(source.user_id),
+        )
+        if result:
+            return (
+                f"✅ Feito: **{result['content']}** da lista **{result['list_name']}**"
+            )
+
+        return (
+            f"Não encontrei '{args}' nas listas ativas. "
+            f"Use `/lists` para ver os itens pendentes."
+        )
+
+    async def _handle_recados_command(self, event: MessageEvent) -> str:
+        """Handle /recados — shortcut to show the Recados list."""
+        if not self._list_manager:
+            return "Gerenciador de listas não disponível."
+
+        list_rec = self._list_manager.find_list_by_name("Recados")
+        if list_rec is None:
+            return "Lista de Recados não encontrada."
+        return self._list_manager.format_list_summary(list_rec["list_id"])
 
     async def _handle_lists_command(self, event: MessageEvent) -> str:
         """Handle /lists — show all active shared lists with counts."""

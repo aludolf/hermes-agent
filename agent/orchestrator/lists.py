@@ -149,6 +149,54 @@ class ListManager:
     # Formatting
     # ------------------------------------------------------------------
 
+    def find_item_fuzzy(self, text: str, *, list_id: str | None = None) -> dict[str, Any] | None:
+        """Fuzzy-match an item by content text across one or all active lists.
+
+        Searches unchecked items. Returns the best match (case-insensitive
+        substring), or None if no match.
+        """
+        text_lower = text.strip().lower()
+        if not text_lower:
+            return None
+
+        if list_id:
+            lists_to_search = [{"list_id": list_id}]
+        else:
+            lists_to_search = self.list_all(status="active")
+
+        best = None
+        for lr in lists_to_search:
+            items = self.get_items(lr["list_id"], include_checked=False)
+            for item in items:
+                content_lower = item["content"].lower()
+                # Exact match takes priority
+                if content_lower == text_lower:
+                    return item
+                # Substring match
+                if text_lower in content_lower or content_lower in text_lower:
+                    if best is None or len(item["content"]) < len(best["content"]):
+                        best = item
+        return best
+
+    def check_item_by_text(
+        self, text: str, checked_by: str, *, list_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find and check off an item by fuzzy text match.
+
+        Returns the checked item dict with list_name, or None if not found.
+        """
+        item = self.find_item_fuzzy(text, list_id=list_id)
+        if item is None:
+            return None
+
+        self.check_item(item["item_id"], checked_by)
+        list_rec = self.db.get_shared_list(item["list_id"])
+        return {
+            **item,
+            "list_name": list_rec["name"] if list_rec else "?",
+            "checked_by": checked_by,
+        }
+
     def format_list_summary(self, list_id: str) -> str:
         """Render a Telegram-friendly list summary for a single list."""
         list_rec = self.db.get_shared_list(list_id)

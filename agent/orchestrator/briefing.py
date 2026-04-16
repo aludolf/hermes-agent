@@ -10,7 +10,6 @@ All output in Portuguese (pt-BR).
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -102,6 +101,22 @@ class BriefingBuilder:
             sections.append(list_summary)
         except Exception as e:
             logger.warning("Briefing lists failed: %s", e)
+
+        # Pending errands (Recados) — highlighted separately
+        try:
+            recados = self.list_manager.find_list_by_name("Recados")
+            if recados:
+                items = self.list_manager.get_items(recados["list_id"])
+                if items:
+                    lines = [f"📌 **Recados pendentes** ({len(items)})"]
+                    for item in items[:10]:
+                        added_by = item.get("added_by_name") or "?"
+                        lines.append(f"• {item['content']} _(por {added_by})_")
+                    if len(items) > 10:
+                        lines.append(f"_...e mais {len(items) - 10}_")
+                    sections.append("\n".join(lines))
+        except Exception as e:
+            logger.warning("Briefing recados failed: %s", e)
 
         return "\n\n".join(sections)
 
