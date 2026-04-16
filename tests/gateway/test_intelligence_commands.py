@@ -263,6 +263,65 @@ def test_pipeline_rejects_unknown_sender_role(tmp_path):
         db.close()
 
 
+def test_scenario_loader_populates_cache_used_by_db_queries(tmp_path):
+    """US6: loader → DB cache → list_scenarios / get_scenario_by_id reads."""
+    import json as _json
+    from agent.orchestrator.scenario_loader import ScenarioLoader
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        scen_dir = tmp_path / "scenarios"
+        scen_dir.mkdir()
+        (scen_dir / "s.yaml").write_text(
+            "id: probe_a\n"
+            "name: \"Probe A\"\n"
+            "category: smoke\n"
+            "target_bot: b\n"
+            "target_chat_id: \"-1\"\n"
+            "steps:\n"
+            "  - step: 1\n    sent: hi\n    expected_pattern: hi\n",
+            encoding="utf-8",
+        )
+        stats = ScenarioLoader(db).load_all_from_dir(scen_dir)
+        assert stats.loaded == 1
+
+        rows = db.list_scenarios()
+        assert len(rows) == 1
+        assert rows[0]["scenario_id"] == "probe_a"
+
+        row = db.get_scenario_by_id("probe_a")
+        assert row is not None
+        assert _json.loads(row["steps_json"])[0]["sent"] == "hi"
+    finally:
+        db.close()
+
+
+def test_test_history_db_query_returns_recent_runs(tmp_path):
+    """US6 /test_history backing: list_harness_runs returns by started_at DESC."""
+    import json as _json
+    import time
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for i in range(3):
+            rid = f"run_{i}"
+            db.create_harness_run(
+                run_id=rid, scenario_id="s1",
+                triggered_by="t", trigger_source="slash_command",
+            )
+            db.complete_harness_run(rid, status="pass", steps_json=_json.dumps([]))
+            time.sleep(0.01)
+
+        runs = db.list_harness_runs(limit=20)
+        assert len(runs) == 3
+        assert runs[0]["run_id"] == "run_2"  # newest first
+
+        filtered = db.list_harness_runs_by_scenario("s1", limit=20)
+        assert len(filtered) == 3
+    finally:
+        db.close()
+
+
 def test_harness_runner_executes_scenario_from_db_cache(tmp_path):
     """US5: scenario loaded from DB cache → HarnessRunner → JSONL + DB row."""
     import asyncio

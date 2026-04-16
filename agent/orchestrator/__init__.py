@@ -33,6 +33,7 @@ from .harness_runner import (
     step_matches,
 )
 from .regression_detector import detect_regressions
+from .scenario_loader import LoadStats, ScenarioLoader, ScenarioValidationError
 from .extraction import (
     ExtractedAction,
     ExtractionResult,
@@ -118,6 +119,9 @@ __all__ = [
     "HarnessRun",
     "HarnessRunner",
     "HarnessStepResult",
+    "LoadStats",
+    "ScenarioLoader",
+    "ScenarioValidationError",
     "ExtractedAction",
     "ExtractionResult",
     "JobStatus",

@@ -1,0 +1,28 @@
+id: rauru_report_generation
+name: "Generate a report via natural language"
+category: regression
+description: |
+  Owner asks Rauru in natural language for a report; bot confirms intent,
+  user confirms, report is generated and delivered.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+preconditions:
+  - "Test user has completed onboarding"
+  - "Test user has >= 1 credit available"
+timeout_per_step_ms: 30000
+steps:
+  - step: 1
+    sent: "quero um relatório completo do meu design"
+    expected_pattern: "(confirm|gerar relatório|generate|custo|cost|1 credit)"
+    match_type: regex
+    gate: true
+  - step: 2
+    sent: "confirmar"
+    expected_pattern: "(gerando|generating|processing|aguarde)"
+    match_type: regex
+  - step: 3
+    sent: "/status"
+    expected_pattern: "(report|relatório|PDF|download|pronto|ready)"
+    match_type: regex
+    timeout_ms: 60000
+    description: "Probe /status until report is ready (may take up to a minute)"

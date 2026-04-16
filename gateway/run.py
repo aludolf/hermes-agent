@@ -666,6 +666,24 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("Reminder service init failed: %s", e)
 
+            # 021 US6: load harness scenarios from YAML at startup.
+            try:
+                from agent.orchestrator.scenario_loader import ScenarioLoader
+                scen_dir = os.getenv(
+                    "HERMES_SCENARIOS_DIR",
+                    str(Path(__file__).resolve().parents[1] / "scenarios"),
+                )
+                stats = ScenarioLoader(self._session_db).load_all_from_dir(scen_dir)
+                logger.info(
+                    "Scenario loader: %d scenarios loaded, %d skipped (from %s)",
+                    stats.loaded, stats.skipped, scen_dir,
+                )
+                if stats.errors:
+                    for err in stats.errors:
+                        logger.warning("Scenario load error: %s", err)
+            except Exception as e:
+                logger.warning("Scenario loader init failed: %s", e)
+
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()

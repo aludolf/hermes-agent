@@ -1,0 +1,18 @@
+id: rauru_returning_user
+name: "Returning user sees their chart, not onboarding"
+category: regression
+description: |
+  Returning user (onboarding already complete) hitting /start should land on
+  their chart summary — NOT be re-routed through the onboarding flow.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+preconditions:
+  - "Test user has completed onboarding at least once"
+timeout_per_step_ms: 10000
+steps:
+  - step: 1
+    sent: "/start@Rauru_HD_bot"
+    expected_pattern: "(your chart|seu mapa|generator|projector|manifestor|reflector|profile)"
+    match_type: regex
+    gate: true
+    description: "Returning user skips onboarding banner"

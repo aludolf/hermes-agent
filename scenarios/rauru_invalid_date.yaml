@@ -1,0 +1,25 @@
+id: rauru_invalid_date
+name: "Invalid date of birth is handled gracefully"
+category: edge
+description: |
+  Sending nonsense in the DOB step must trigger a clear error + re-prompt,
+  not crash or silently accept. Pre-1970 dates and non-date text both
+  exercised the bug fixed in HD S33.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+timeout_per_step_ms: 10000
+steps:
+  - step: 1
+    sent: "/start@Rauru_HD_bot"
+    expected_pattern: "(Welcome|Bem-vindo)"
+    match_type: regex
+    gate: true
+  - step: 2
+    sent: "English"
+    expected_pattern: "(date of birth|data de nascimento)"
+    match_type: regex
+  - step: 3
+    sent: "not a date at all"
+    expected_pattern: "(invalid|could not|não entendi|try again|tente novamente)"
+    match_type: regex
+    description: "Bot rejects junk input with a helpful retry message"

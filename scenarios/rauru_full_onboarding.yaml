@@ -1,0 +1,44 @@
+id: rauru_full_onboarding
+name: "Rauru full new-user onboarding"
+category: smoke
+description: |
+  Complete new-user flow: /start → language → DOB → time of birth → city →
+  confirm → familiarity. Validates Rauru's end-to-end onboarding script.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+preconditions:
+  - "Rauru is running"
+  - "HDbotDebug group is active"
+  - "Test user has not completed onboarding (reset if needed)"
+timeout_per_step_ms: 20000
+steps:
+  - step: 1
+    sent: "/start@Rauru_HD_bot"
+    expected_pattern: "(Welcome|Bem-vindo)"
+    match_type: regex
+    gate: true
+  - step: 2
+    sent: "English"
+    expected_pattern: "(date of birth|data de nascimento)"
+    match_type: regex
+  - step: 3
+    sent: "15 March 1985"
+    expected_pattern: "(time of birth|hour|hora)"
+    match_type: regex
+  - step: 4
+    sent: "14:30"
+    expected_pattern: "(city|cidade|birthplace)"
+    match_type: regex
+  - step: 5
+    sent: "São Paulo, Brazil"
+    expected_pattern: "(confirm|confirma)"
+    match_type: regex
+  - step: 6
+    sent: "yes"
+    expected_pattern: "(familiarity|familiar|Human Design)"
+    match_type: regex
+  - step: 7
+    sent: "new"
+    expected_pattern: "(type|profile|chart|generator|projector|manifestor|reflector)"
+    match_type: regex
+    description: "Chart archetype revealed after onboarding completes"
