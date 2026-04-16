@@ -184,6 +184,91 @@ class ReminderStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+# ---------------------------------------------------------------------------
+# 021: Intelligence Layer enums
+# ---------------------------------------------------------------------------
+
+class ActionType(StrEnum):
+    """Types of action Sonnet can extract from a transcript or document."""
+    TASK = "task"
+    MEETING = "meeting"
+    REMINDER = "reminder"
+    KB_ENTRY = "kb_entry"
+    ENTITY_UPDATE = "entity_update"
+    DECISION = "decision"
+    INFO = "info"
+
+
+class SourceKind(StrEnum):
+    """Origin of an extraction event."""
+    VOICE_NOTE = "voice_note"
+    DOCUMENT_UPLOAD = "document_upload"
+    PASTED_TEXT = "pasted_text"
+
+
+class ExecutionMode(StrEnum):
+    """How an extraction result is dispatched."""
+    AUTO = "auto"
+    PREVIEW = "preview"
+    SKIPPED = "skipped"
+
+
+class PreviewStatus(StrEnum):
+    """Lifecycle state of a PendingPreview."""
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    CONFIRMED = "confirmed"
+    PARTIAL_CONFIRMED = "partial_confirmed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class EntityType(StrEnum):
+    """Kind of entity tracked in the Hermes-scoped entity context."""
+    PERSON = "person"
+    PROJECT = "project"
+    TOOL = "tool"
+    CONCEPT = "concept"
+
+
+class ScenarioCategory(StrEnum):
+    """Category of a harness scenario."""
+    SMOKE = "smoke"
+    REGRESSION = "regression"
+    EDGE = "edge"
+
+
+class RunStatus(StrEnum):
+    """Lifecycle state of a HarnessRun."""
+    RUNNING = "running"
+    PASS = "pass"
+    FAIL = "fail"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+
+
+class StepStatus(StrEnum):
+    """Lifecycle state of a single harness step."""
+    PASS = "pass"
+    FAIL = "fail"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+    ERROR = "error"
+
+
+class MatchType(StrEnum):
+    """How a step's expected_pattern is matched against the received text."""
+    SUBSTRING = "substring"
+    REGEX = "regex"
+    EXACT = "exact"
+
+
+class TriggerSource(StrEnum):
+    """How a harness run was triggered."""
+    SLASH_COMMAND = "slash_command"
+    NATURAL_LANGUAGE = "natural_language"
+    CRON = "cron"
+
+
 @dataclass(frozen=True)
 class SourceRef:
     """Normalized origin metadata for an orchestrator job."""

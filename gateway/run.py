@@ -2698,6 +2698,87 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    async def _maybe_intercept_voice_extraction(
+        self,
+        *,
+        event: "MessageEvent",
+        source: "SessionSource",
+        message_text: str,
+    ) -> Optional[str]:
+        """Post-STT voice-note extraction interception (021 US1).
+
+        When the inbound event was a voice note from an owner or approved
+        contact and the STT-enriched text is short (<2000 chars), send the
+        transcript through the Sonnet extraction engine and route any
+        confident actions to their handlers.
+
+        Returns a Portuguese summary string to send back, or None to fall
+        through to the normal LLM session.
+        """
+        if self._contact_manager is None:
+            return None
+        if source.user_id is None or source.platform is None:
+            return None
+        if source.platform.value != "telegram":
+            return None
+        # Internal (system-generated) events shouldn't trigger extraction.
+        if getattr(event, "internal", False):
+            return None
+
+        # Detect voice/audio attachment on this message.
+        had_audio = False
+        if event.media_urls:
+            media_types = getattr(event, "media_types", []) or []
+            for i, _path in enumerate(event.media_urls):
+                mtype = media_types[i] if i < len(media_types) else ""
+                if mtype.startswith("audio/") or event.message_type in (
+                    MessageType.VOICE, MessageType.AUDIO,
+                ):
+                    had_audio = True
+                    break
+        if not had_audio:
+            return None
+
+        rec = self._contact_manager.get_role(source.user_id)
+        if rec is None or rec.get("role") not in ("owner", "contact"):
+            return None
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+
+        from agent.orchestrator.voice_note_pipeline import (
+            extract_voice_transcript,
+            perform_extraction,
+        )
+
+        transcript = extract_voice_transcript(message_text)
+        if not transcript:
+            return None
+
+        try:
+            outcome = await perform_extraction(
+                transcript=transcript,
+                sender_id=str(source.user_id),
+                sender_role=rec["role"],
+                sender_capabilities=capabilities,
+                sender_name=source.user_name,
+                source_type="voice_note",
+                source_format="ogg",
+                session_db=self._session_db,
+                list_manager=self._list_manager,
+                calendar_bridge=self._calendar_bridge,
+                reminder_service=self._reminder_service,
+            )
+        except Exception as e:
+            logger.warning("voice extraction pipeline error: %s", e)
+            return None
+
+        if outcome is None:
+            return None
+        logger.info(
+            "voice extraction intercepted: ext=%s actions=%d",
+            outcome.extraction_id, len(outcome.routed),
+        )
+        return outcome.reply_text
+
     async def _handle_contact_list_intent(self, event: "MessageEvent") -> Optional[str]:
         """Try to handle a contact's message as a list operation (no LLM).
 
@@ -4406,6 +4487,23 @@ class GatewayRunner:
             history=history,
         )
         if message_text is None:
+            return
+
+        # 021: post-STT voice-note extraction interception.
+        # Owners and approved contacts sending a voice note get their
+        # transcript passed through the Sonnet-based extraction engine BEFORE
+        # an agent session spawns. On success, we reply in Portuguese with
+        # the routed actions and skip the LLM entirely.
+        _intercept_reply = await self._maybe_intercept_voice_extraction(
+            event=event, source=source, message_text=message_text,
+        )
+        if _intercept_reply is not None:
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                try:
+                    await adapter.send(source.chat_id, _intercept_reply)
+                except Exception as e:
+                    logger.warning("voice extraction reply send failed: %s", e)
             return
 
         try:

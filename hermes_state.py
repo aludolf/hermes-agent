@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -352,6 +352,110 @@ CREATE TABLE IF NOT EXISTS meeting_reminders_sent (
     event_id TEXT PRIMARY KEY,
     reminded_at REAL NOT NULL
 );
+
+-- =====================================================================
+-- Intelligence Layer tables (021)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS extraction_events (
+    extraction_id TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_format TEXT,
+    source_job_id TEXT,
+    transcript_hash TEXT NOT NULL,
+    transcript_preview TEXT,
+    transcript_full_path TEXT,
+    sender_id TEXT NOT NULL,
+    sender_role TEXT NOT NULL,
+    actions_json TEXT,
+    actions_count INTEGER DEFAULT 0,
+    execution_mode TEXT NOT NULL,
+    language TEXT DEFAULT 'pt-BR',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_hash ON extraction_events(transcript_hash);
+CREATE INDEX IF NOT EXISTS idx_extraction_sender ON extraction_events(sender_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_created ON extraction_events(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS pending_previews (
+    preview_id TEXT PRIMARY KEY,
+    extraction_id TEXT NOT NULL REFERENCES extraction_events(extraction_id),
+    sender_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    actions_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'awaiting_confirmation',
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_preview_sender ON pending_previews(sender_id);
+CREATE INDEX IF NOT EXISTS idx_preview_status ON pending_previews(status);
+CREATE INDEX IF NOT EXISTS idx_preview_expires ON pending_previews(expires_at);
+
+CREATE TABLE IF NOT EXISTS entity_context (
+    entity_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_lower TEXT NOT NULL UNIQUE,
+    entity_type TEXT NOT NULL DEFAULT 'person',
+    context_snippets_json TEXT,
+    first_mentioned_at REAL NOT NULL,
+    last_mentioned_at REAL NOT NULL,
+    mention_count INTEGER DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_type ON entity_context(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entity_last_mentioned ON entity_context(last_mentioned_at DESC);
+
+CREATE TABLE IF NOT EXISTS harness_scenarios_cache (
+    scenario_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT,
+    preconditions_json TEXT,
+    steps_json TEXT NOT NULL,
+    estimated_duration_ms INTEGER,
+    target_bot TEXT NOT NULL,
+    target_chat_id TEXT NOT NULL,
+    yaml_path TEXT NOT NULL,
+    yaml_hash TEXT NOT NULL,
+    loaded_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_scenarios_category ON harness_scenarios_cache(category);
+
+CREATE TABLE IF NOT EXISTS harness_runs (
+    run_id TEXT PRIMARY KEY,
+    scenario_id TEXT NOT NULL,
+    triggered_by TEXT NOT NULL,
+    trigger_source TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    duration_ms INTEGER,
+    status TEXT NOT NULL,
+    steps_json TEXT,
+    regression_flags_json TEXT,
+    last_passing_run_id TEXT,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_scenario ON harness_runs(scenario_id);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON harness_runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON harness_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS transcript_extraction_links (
+    link_id TEXT PRIMARY KEY,
+    extraction_id TEXT NOT NULL REFERENCES extraction_events(extraction_id),
+    job_id TEXT NOT NULL REFERENCES orchestrator_jobs(job_id),
+    working_artifact_id TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_extraction ON transcript_extraction_links(extraction_id);
+CREATE INDEX IF NOT EXISTS idx_links_job ON transcript_extraction_links(job_id);
 """
 
 
@@ -580,6 +684,11 @@ class SessionDB:
                 # v8: productivity orchestrator (contacts + future lists/reminders)
                 cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
                 cursor.execute("UPDATE schema_version SET version = 8")
+            if current_version < 9:
+                # v9: intelligence layer (021) — extraction events, pending previews,
+                # entity context, harness scenarios + runs, transcript-extraction lineage
+                cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
+                cursor.execute("UPDATE schema_version SET version = 9")
 
         # Ensure orchestrator tables exist for fresh databases too
         cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
@@ -2268,3 +2377,362 @@ class SessionDB:
                 (event_id,),
             ).fetchone()
             return row is not None
+
+    # =========================================================================
+    # Intelligence Layer: Extraction Events (021)
+    # =========================================================================
+
+    def create_extraction_event(
+        self, *, extraction_id, source_type, transcript_hash, sender_id,
+        sender_role, execution_mode, source_format=None, source_job_id=None,
+        transcript_preview=None, transcript_full_path=None,
+        actions_json=None, actions_count=0, language="pt-BR",
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO extraction_events
+                   (extraction_id, source_type, source_format, source_job_id,
+                    transcript_hash, transcript_preview, transcript_full_path,
+                    sender_id, sender_role, actions_json, actions_count,
+                    execution_mode, language, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (extraction_id, str(source_type), source_format, source_job_id,
+                 transcript_hash, transcript_preview, transcript_full_path,
+                 str(sender_id), str(sender_role), actions_json, actions_count,
+                 str(execution_mode), language, time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_extraction_by_hash(self, transcript_hash):
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM extraction_events
+                   WHERE transcript_hash = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (transcript_hash,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_extraction_events(self, *, sender_id=None, limit=50):
+        clauses, params = [], []
+        if sender_id:
+            clauses.append("sender_id = ?"); params.append(str(sender_id))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM extraction_events{where} "
+                f"ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_extraction_execution_mode(self, extraction_id, execution_mode):
+        def _do(conn):
+            conn.execute(
+                "UPDATE extraction_events SET execution_mode = ? "
+                "WHERE extraction_id = ?",
+                (str(execution_mode), extraction_id),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Intelligence Layer: Pending Previews (021)
+    # =========================================================================
+
+    def create_pending_preview(
+        self, *, preview_id, extraction_id, sender_id, chat_id,
+        actions_json, ttl_seconds=600,
+    ):
+        now = time.time()
+        def _do(conn):
+            # Expire any prior active preview for this sender — one active per sender.
+            conn.execute(
+                """UPDATE pending_previews
+                   SET status = 'expired', resolved_at = ?
+                   WHERE sender_id = ? AND status = 'awaiting_confirmation'""",
+                (now, str(sender_id)),
+            )
+            conn.execute(
+                """INSERT INTO pending_previews
+                   (preview_id, extraction_id, sender_id, chat_id,
+                    actions_json, status, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, 'awaiting_confirmation', ?, ?)""",
+                (preview_id, extraction_id, str(sender_id), str(chat_id),
+                 actions_json, now, now + ttl_seconds),
+            )
+        self._execute_write(_do)
+
+    def get_active_preview_by_sender(self, sender_id):
+        """Get active preview for sender; auto-expire if past TTL."""
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM pending_previews
+                   WHERE sender_id = ? AND status = 'awaiting_confirmation'
+                   ORDER BY created_at DESC LIMIT 1""",
+                (str(sender_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            preview = dict(row)
+        if preview["expires_at"] < now:
+            self.update_preview_status(preview["preview_id"], "expired")
+            return None
+        return preview
+
+    def update_preview_status(self, preview_id, status):
+        def _do(conn):
+            conn.execute(
+                """UPDATE pending_previews
+                   SET status = ?, resolved_at = ?
+                   WHERE preview_id = ?""",
+                (str(status), time.time(), preview_id),
+            )
+        self._execute_write(_do)
+
+    def expire_stale_previews(self):
+        now = time.time()
+        def _do(conn):
+            conn.execute(
+                """UPDATE pending_previews
+                   SET status = 'expired', resolved_at = ?
+                   WHERE status = 'awaiting_confirmation' AND expires_at < ?""",
+                (now, now),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Intelligence Layer: Entity Context (021)
+    # =========================================================================
+
+    def upsert_entity(
+        self, *, entity_id, name, entity_type="person",
+        context_snippets_json=None,
+    ):
+        """Insert a new entity or bump last_mentioned_at + mention_count."""
+        name_lower = name.strip().lower()
+        now = time.time()
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT entity_id, mention_count FROM entity_context "
+                "WHERE name_lower = ?",
+                (name_lower,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE entity_context
+                       SET last_mentioned_at = ?, mention_count = ?, updated_at = ?
+                       WHERE entity_id = ?""",
+                    (now, existing["mention_count"] + 1, now, existing["entity_id"]),
+                )
+                return existing["entity_id"]
+            conn.execute(
+                """INSERT INTO entity_context
+                   (entity_id, name, name_lower, entity_type,
+                    context_snippets_json, first_mentioned_at, last_mentioned_at,
+                    mention_count, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                (entity_id, name, name_lower, str(entity_type),
+                 context_snippets_json, now, now, now),
+            )
+            return entity_id
+        return self._execute_write(_do)
+
+    def get_entity_by_name(self, name):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM entity_context WHERE name_lower = ?",
+                (name.strip().lower(),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def append_entity_context_snippet(self, entity_id, snippets_json):
+        def _do(conn):
+            conn.execute(
+                """UPDATE entity_context
+                   SET context_snippets_json = ?, updated_at = ?
+                   WHERE entity_id = ?""",
+                (snippets_json, time.time(), entity_id),
+            )
+        self._execute_write(_do)
+
+    def list_entities(self, *, entity_type=None, limit=100):
+        clauses, params = [], []
+        if entity_type:
+            clauses.append("entity_type = ?"); params.append(str(entity_type))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM entity_context{where} "
+                f"ORDER BY last_mentioned_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_entity_mention_count(self, entity_id, mention_count):
+        def _do(conn):
+            conn.execute(
+                """UPDATE entity_context
+                   SET mention_count = ?, updated_at = ?
+                   WHERE entity_id = ?""",
+                (mention_count, time.time(), entity_id),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Intelligence Layer: Harness Scenarios Cache (021)
+    # =========================================================================
+
+    def upsert_scenario_from_yaml(
+        self, *, scenario_id, name, category, steps_json, target_bot,
+        target_chat_id, yaml_path, yaml_hash, description=None,
+        preconditions_json=None, estimated_duration_ms=None,
+    ):
+        now = time.time()
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO harness_scenarios_cache
+                   (scenario_id, name, category, description, preconditions_json,
+                    steps_json, estimated_duration_ms, target_bot, target_chat_id,
+                    yaml_path, yaml_hash, loaded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(scenario_id) DO UPDATE SET
+                       name = excluded.name,
+                       category = excluded.category,
+                       description = excluded.description,
+                       preconditions_json = excluded.preconditions_json,
+                       steps_json = excluded.steps_json,
+                       estimated_duration_ms = excluded.estimated_duration_ms,
+                       target_bot = excluded.target_bot,
+                       target_chat_id = excluded.target_chat_id,
+                       yaml_path = excluded.yaml_path,
+                       yaml_hash = excluded.yaml_hash,
+                       loaded_at = excluded.loaded_at""",
+                (scenario_id, name, str(category), description,
+                 preconditions_json, steps_json, estimated_duration_ms,
+                 target_bot, str(target_chat_id), yaml_path, yaml_hash, now),
+            )
+        self._execute_write(_do)
+
+    def list_scenarios(self, *, category=None):
+        clauses, params = [], []
+        if category:
+            clauses.append("category = ?"); params.append(str(category))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM harness_scenarios_cache{where} "
+                f"ORDER BY scenario_id ASC",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_scenario_by_id(self, scenario_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM harness_scenarios_cache WHERE scenario_id = ?",
+                (scenario_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def clear_scenarios_cache(self):
+        def _do(conn):
+            conn.execute("DELETE FROM harness_scenarios_cache")
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Intelligence Layer: Harness Runs (021)
+    # =========================================================================
+
+    def create_harness_run(
+        self, *, run_id, scenario_id, triggered_by, trigger_source,
+        last_passing_run_id=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO harness_runs
+                   (run_id, scenario_id, triggered_by, trigger_source,
+                    started_at, status, last_passing_run_id)
+                   VALUES (?, ?, ?, ?, ?, 'running', ?)""",
+                (run_id, scenario_id, triggered_by, str(trigger_source),
+                 time.time(), last_passing_run_id),
+            )
+        self._execute_write(_do)
+
+    def complete_harness_run(
+        self, run_id, *, status, steps_json=None,
+        regression_flags_json=None, error_message=None,
+    ):
+        finished = time.time()
+        def _do(conn):
+            started = conn.execute(
+                "SELECT started_at FROM harness_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            duration_ms = None
+            if started is not None:
+                duration_ms = int((finished - started["started_at"]) * 1000)
+            conn.execute(
+                """UPDATE harness_runs
+                   SET finished_at = ?, duration_ms = ?, status = ?,
+                       steps_json = ?, regression_flags_json = ?,
+                       error_message = ?
+                   WHERE run_id = ?""",
+                (finished, duration_ms, str(status), steps_json,
+                 regression_flags_json, error_message, run_id),
+            )
+        self._execute_write(_do)
+
+    def list_harness_runs(self, *, limit=20):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM harness_runs ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_harness_runs_by_scenario(self, scenario_id, *, limit=20):
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM harness_runs WHERE scenario_id = ?
+                   ORDER BY started_at DESC LIMIT ?""",
+                (scenario_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_last_passing_run(self, scenario_id):
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM harness_runs
+                   WHERE scenario_id = ? AND status = 'pass'
+                   ORDER BY started_at DESC LIMIT 1""",
+                (scenario_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    # =========================================================================
+    # Intelligence Layer: Transcript ↔ Extraction ↔ Job Lineage (021)
+    # =========================================================================
+
+    def link_extraction_to_job(
+        self, *, link_id, extraction_id, job_id, working_artifact_id=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO transcript_extraction_links
+                   (link_id, extraction_id, job_id, working_artifact_id, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (link_id, extraction_id, job_id, working_artifact_id, time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_extraction_job_ids(self, extraction_id):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT job_id FROM transcript_extraction_links "
+                "WHERE extraction_id = ? ORDER BY created_at ASC",
+                (extraction_id,),
+            ).fetchall()
+            return [row["job_id"] for row in rows]
