@@ -725,3 +725,65 @@ class OrchestratorJobService:
             "link_id": link_id,
             "extraction_id": extraction_id,
         }
+
+    def track_harness_run(
+        self,
+        *,
+        run_id: str,
+        scenario_id: str,
+        triggered_by: str,
+        status: str,
+        steps_count: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Bridge a HarnessRun into the 002 knowledge layer (021 US5).
+
+        Mirrors track_extraction_event: one orchestrator_job + working
+        artifact per run so /jobs and get_lineage can reach harness runs
+        via the shared 002 scaffolding.
+        """
+        from .router import tier_for_route
+
+        combined = dict(metadata or {})
+        combined["run_id"] = run_id
+        combined["scenario_id"] = scenario_id
+        combined["status"] = status
+        combined["steps_count"] = steps_count
+
+        job_id = _new_id("job")
+        self.db.create_orchestrator_job(
+            job_id=job_id,
+            job_type="harness_run",
+            requested_by=triggered_by,
+            source_type="telegram",
+            intent="harness",
+            metadata_json=combined,
+        )
+        self.db.update_orchestrator_job_status(
+            job_id, "completed" if status in ("pass", "fail", "timeout", "error") else "running",
+        )
+        self.db.record_routing_decision(
+            decision_id=_new_id("route"),
+            job_id=job_id,
+            route_class="generated_output",
+            decision_reason=f"Harness run: {scenario_id}",
+            confidence=1.0,
+        )
+        self.db.create_layer_assignment(
+            assignment_id=_new_id("layer"),
+            job_id=job_id,
+            route_class="generated_output",
+            knowledge_tier=tier_for_route("generated_output"),
+            decision_reason=f"Harness run: {scenario_id}",
+            confidence=1.0,
+        )
+        working_id = _new_id("wrk")
+        self.db.create_working_artifact(
+            working_id=working_id,
+            job_id=job_id,
+            artifact_kind="harness_run",
+            destination_path=f"harness/{scenario_id}/{run_id}.json",
+            title=f"Harness: {scenario_id} ({status})",
+            metadata_json=combined,
+        )
+        return {"job_id": job_id, "working_id": working_id, "run_id": run_id}

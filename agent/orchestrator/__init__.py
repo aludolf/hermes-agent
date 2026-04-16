@@ -22,6 +22,17 @@ from .document_converter import (
     SUPPORTED_EXTENSIONS as DOCUMENT_SUPPORTED_EXTENSIONS,
 )
 from .entity_context import EntityContextManager
+from .harness_runner import (
+    HarnessRun,
+    HarnessRunner,
+    StepResult as HarnessStepResult,
+    append_result_jsonl,
+    default_inbox_path,
+    default_results_path,
+    read_inbox_jsonl,
+    step_matches,
+)
+from .regression_detector import detect_regressions
 from .extraction import (
     ExtractedAction,
     ExtractionResult,
@@ -104,6 +115,9 @@ __all__ = [
     "EntityContextManager",
     "EntityType",
     "ExecutionMode",
+    "HarnessRun",
+    "HarnessRunner",
+    "HarnessStepResult",
     "ExtractedAction",
     "ExtractionResult",
     "JobStatus",
@@ -136,10 +150,14 @@ __all__ = [
     "ValidationStatus",
     "WorkingArtifactStatus",
     "WorkingVisibility",
+    "append_result_jsonl",
     "build_extraction_system_prompt",
     "build_raw_artifact_path",
     "classify_route",
     "compute_transcript_hash",
+    "default_inbox_path",
+    "default_results_path",
+    "detect_regressions",
     "ensure_raw_storage_layout",
     "evaluate_action_policy",
     "extract_actions",
@@ -153,5 +171,7 @@ __all__ = [
     "new_preview_id",
     "parse_portuguese_datetime",
     "parse_preview_reply",
+    "read_inbox_jsonl",
     "route_actions",
+    "step_matches",
 ]

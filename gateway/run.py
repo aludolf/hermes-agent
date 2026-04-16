@@ -2916,6 +2916,196 @@ class GatewayRunner:
             return "Nenhuma ação clara foi detectada na transcrição."
         return outcome.reply_text
 
+    def _get_harness_runner(self):
+        """Lazily-instantiated per-process HarnessRunner (021 US5).
+
+        Reuses a single runner so the per-scenario asyncio lock (FR-023) is
+        shared across /run_test invocations in the same process.
+        """
+        if getattr(self, "_harness_runner_cached", None) is not None:
+            return self._harness_runner_cached
+        if self._session_db is None:
+            return None
+        from agent.orchestrator.harness_runner import HarnessRunner
+
+        async def _send(chat_id: str, text: str):
+            # The runner doesn't know which platform to route to — for v1
+            # every scenario targets Telegram, so we use the Telegram adapter
+            # directly. If no Telegram adapter is wired (e.g. tests), fall
+            # through to any configured adapter.
+            from gateway.session_context import Platform as _Platform
+            adapter = self.adapters.get(_Platform.TELEGRAM) if hasattr(_Platform, "TELEGRAM") else None
+            if adapter is None:
+                # Fallback: pick the first available adapter.
+                adapters = list(self.adapters.values())
+                adapter = adapters[0] if adapters else None
+            if adapter is None:
+                raise RuntimeError("no adapter available for harness send")
+            await adapter.send(chat_id, text)
+
+        runner = HarnessRunner(self._session_db, send_message=_send)
+        self._harness_runner_cached = runner
+        return runner
+
+    async def _handle_run_test_command(self, event: "MessageEvent") -> str:
+        """Handle /run_test <scenario_id> — execute a harness scenario (021 US5)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /run_test."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        raw = (getattr(event, "text", "") or "").strip()
+        parts = raw.split(None, 1)
+        scenario_id = parts[1].strip() if len(parts) > 1 else ""
+        if not scenario_id:
+            return (
+                "Uso: `/run_test <scenario_id>`\n\n"
+                "Use `/scenarios` para listar os cenários disponíveis."
+            )
+
+        scen = self._session_db.get_scenario_by_id(scenario_id)
+        if scen is None:
+            return f"Cenário `{scenario_id}` não encontrado. Use `/scenarios` para listar."
+
+        # Deserialize DB row into the dict shape HarnessRunner expects.
+        import json as _json
+        try:
+            steps = _json.loads(scen["steps_json"]) if scen.get("steps_json") else []
+        except (_json.JSONDecodeError, TypeError):
+            steps = []
+        scenario = {
+            "scenario_id": scen["scenario_id"],
+            "name": scen.get("name"),
+            "category": scen.get("category"),
+            "target_bot": scen.get("target_bot"),
+            "target_chat_id": scen.get("target_chat_id"),
+            "steps": steps,
+        }
+
+        runner = self._get_harness_runner()
+        if runner is None:
+            return "⚠️ Runner indisponível."
+
+        # Fire the run in the background so we can reply immediately.
+        triggered_by = f"hermes:owner:{source.user_id}"
+
+        async def _run_and_reply():
+            try:
+                run = await runner.run_scenario(
+                    scenario, triggered_by=triggered_by,
+                    trigger_source="slash_command",
+                )
+            except Exception as e:
+                logger.warning("/run_test pipeline error: %s", e)
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id, f"⚠️ Execução falhou: {e}"
+                    )
+                return
+            # 002 lineage link.
+            try:
+                from agent.orchestrator.jobs import OrchestratorJobService
+                svc = OrchestratorJobService(self._session_db)
+                svc.track_harness_run(
+                    run_id=run.run_id, scenario_id=run.scenario_id,
+                    triggered_by=triggered_by, status=run.status,
+                    steps_count=len(run.steps),
+                )
+            except Exception as e:
+                logger.debug("harness lineage link failed: %s", e)
+
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                emoji = {"pass": "✅", "fail": "❌", "timeout": "⏱️", "error": "⚠️"}.get(run.status, "•")
+                lines = [
+                    f"{emoji} **{run.scenario_name}** — {run.status.upper()} "
+                    f"({run.duration_ms}ms)",
+                ]
+                for s in run.steps:
+                    mark = {"pass": "✓", "fail": "✗", "timeout": "⏱", "skipped": "—", "error": "⚠"}.get(s.status, "?")
+                    lines.append(f"  {mark} {s.step}. {s.sent[:40]}  ({s.duration_ms}ms)")
+                if run.regression_flags:
+                    lines.append(f"⚠️ Regressão nas etapas: {run.regression_flags}")
+                await adapter.send(source.chat_id, "\n".join(lines))
+
+        # Track the background task so it isn't GC'd mid-run.
+        task = asyncio.create_task(_run_and_reply())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        return f"▶️ Executando `{scenario_id}`… aguardando resposta de {scen.get('target_bot')}."
+
+    async def _handle_scenarios_command(self, event: "MessageEvent") -> str:
+        """Handle /scenarios — list available harness scenarios (owner only)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /scenarios."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        rows = self._session_db.list_scenarios()
+        if not rows:
+            return (
+                "Nenhum cenário carregado.\n"
+                "Adicione um `.yaml` em `scenarios/` e refaça o deploy."
+            )
+        lines = [f"🧪 **Cenários carregados** ({len(rows)})"]
+        for r in rows:
+            dur = r.get("estimated_duration_ms") or 0
+            lines.append(
+                f"  • `{r['scenario_id']}` — {r.get('name')} "
+                f"({r.get('category')}, ~{int(dur / 1000)}s)"
+            )
+        return "\n".join(lines)
+
+    async def _handle_test_history_command(self, event: "MessageEvent") -> str:
+        """Handle /test_history [scenario_id] — recent harness runs."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /test_history."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        raw = (getattr(event, "text", "") or "").strip()
+        parts = raw.split(None, 1)
+        scenario_id = parts[1].strip() if len(parts) > 1 else None
+
+        if scenario_id:
+            runs = self._session_db.list_harness_runs_by_scenario(
+                scenario_id, limit=20,
+            )
+            header = f"📜 **Histórico — {scenario_id}** ({len(runs)} últimas execuções)"
+        else:
+            runs = self._session_db.list_harness_runs(limit=20)
+            header = f"📜 **Histórico** ({len(runs)} últimas execuções)"
+
+        if not runs:
+            return "Nenhuma execução encontrada."
+
+        from datetime import datetime, timezone, timedelta
+        brt = timezone(timedelta(hours=-3))
+        lines = [header]
+        for r in runs:
+            when = datetime.fromtimestamp(
+                r.get("started_at") or 0, tz=brt,
+            ).strftime("%Y-%m-%d %H:%M")
+            emoji = {"pass": "✅", "fail": "❌", "timeout": "⏱️", "error": "⚠️"}.get(
+                r.get("status", ""), "•",
+            )
+            lines.append(
+                f"  {emoji} {when} — `{r['scenario_id']}` "
+                f"({r.get('status')}, {r.get('duration_ms') or 0}ms)"
+            )
+        return "\n".join(lines)
+
     async def _handle_entity_command(self, event: "MessageEvent") -> str:
         """Handle /entity <name> — show accumulated context (owner only, 021 US4)."""
         source = event.source
@@ -3716,6 +3906,12 @@ class GatewayRunner:
                 return await self._handle_entity_command(event)
             if event.get_command() == "entities":
                 return await self._handle_entities_command(event)
+            if event.get_command() == "run_test":
+                return await self._handle_run_test_command(event)
+            if event.get_command() == "scenarios":
+                return await self._handle_scenarios_command(event)
+            if event.get_command() == "test_history":
+                return await self._handle_test_history_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3911,6 +4107,12 @@ class GatewayRunner:
             return await self._handle_entity_command(event)
         if canonical == "entities":
             return await self._handle_entities_command(event)
+        if canonical == "run_test":
+            return await self._handle_run_test_command(event)
+        if canonical == "scenarios":
+            return await self._handle_scenarios_command(event)
+        if canonical == "test_history":
+            return await self._handle_test_history_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)

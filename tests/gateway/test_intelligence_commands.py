@@ -263,6 +263,68 @@ def test_pipeline_rejects_unknown_sender_role(tmp_path):
         db.close()
 
 
+def test_harness_runner_executes_scenario_from_db_cache(tmp_path):
+    """US5: scenario loaded from DB cache → HarnessRunner → JSONL + DB row."""
+    import asyncio
+    import json as _json
+    from agent.orchestrator.harness_runner import HarnessRunner
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        steps = [
+            {"step": 1, "sent": "/start", "expected_pattern": "Welcome",
+             "match_type": "substring", "timeout_ms": 500, "gate": True},
+        ]
+        db.upsert_scenario_from_yaml(
+            scenario_id="rauru_smoke",
+            name="Rauru smoke",
+            category="smoke",
+            steps_json=_json.dumps(steps),
+            target_bot="Rauru_HD_bot",
+            target_chat_id="-1001",
+            yaml_path="scenarios/rauru_smoke.yaml",
+            yaml_hash="abc123",
+        )
+
+        # Simulate the gateway's hydration path
+        row = db.get_scenario_by_id("rauru_smoke")
+        assert row is not None
+        scenario = {
+            "scenario_id": row["scenario_id"],
+            "name": row["name"],
+            "category": row["category"],
+            "target_bot": row["target_bot"],
+            "target_chat_id": row["target_chat_id"],
+            "steps": _json.loads(row["steps_json"]),
+        }
+
+        inbox_records: list = []
+
+        async def _send(chat_id: str, text: str):
+            inbox_records.append({
+                "user_name": "Rauru_HD_bot",
+                "user_id": "r1",
+                "text": "Welcome to Rauru!",
+            })
+
+        runner = HarnessRunner(
+            db, send_message=_send,
+            inbox_reader=lambda: list(inbox_records),
+            results_path=tmp_path / "harness_results.jsonl",
+        )
+
+        loop = asyncio.new_event_loop()
+        run = loop.run_until_complete(runner.run_scenario(
+            scenario, triggered_by="hermes:owner:1",
+            trigger_source="slash_command",
+        ))
+        assert run.status == "pass"
+        assert run.steps[0].status == "pass"
+        assert (tmp_path / "harness_results.jsonl").exists()
+    finally:
+        db.close()
+
+
 def test_pipeline_accumulates_entities_from_extraction(tmp_path):
     """US4: entities_mentioned in ExtractionResult → entity_context rows."""
     db = SessionDB(db_path=tmp_path / "state.db")
