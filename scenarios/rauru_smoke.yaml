@@ -1,0 +1,28 @@
+id: rauru_smoke
+name: "Rauru onboarding + credits smoke test"
+category: smoke
+description: |
+  Fast 3-step sanity check. Verifies /start brings up the welcome banner,
+  language selection lands on the DOB prompt, and /credits returns a balance.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+preconditions:
+  - "Rauru is running"
+  - "HDbotDebug group is active and Hermes is a member"
+timeout_per_step_ms: 15000
+steps:
+  - step: 1
+    sent: "/start@Rauru_HD_bot"
+    expected_pattern: "(Welcome|Bem-vindo|Rauru)"
+    match_type: regex
+    gate: true
+    description: "User initiates onboarding"
+  - step: 2
+    sent: "English"
+    expected_pattern: "(date of birth|data de nascimento)"
+    match_type: regex
+  - step: 3
+    sent: "/credits@Rauru_HD_bot"
+    expected_pattern: "(credits|créditos|balance)"
+    match_type: regex
+    description: "/credits returns a valid balance summary"

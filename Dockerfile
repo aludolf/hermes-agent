@@ -38,6 +38,9 @@ USER hermes
 RUN uv venv && \
     uv pip install --no-cache-dir -e ".[all]"
 
+# 021 intelligence layer: MarkItDown for document→markdown conversion
+RUN uv pip install --no-cache-dir "markitdown[all]"
+
 USER root
 RUN chmod +x /opt/hermes/docker/entrypoint.sh
 

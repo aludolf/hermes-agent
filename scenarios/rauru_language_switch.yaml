@@ -1,0 +1,24 @@
+id: rauru_language_switch
+name: "Language switch mid-session adapts responses"
+category: edge
+description: |
+  Mid-session /language change should propagate — subsequent replies must
+  match the newly selected language.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+timeout_per_step_ms: 10000
+steps:
+  - step: 1
+    sent: "/language@Rauru_HD_bot"
+    expected_pattern: "(choose|select|escolha|língua|language)"
+    match_type: regex
+    gate: true
+  - step: 2
+    sent: "Português"
+    expected_pattern: "(idioma|português|escolhido|pronto)"
+    match_type: regex
+  - step: 3
+    sent: "/credits@Rauru_HD_bot"
+    expected_pattern: "(créditos|saldo)"
+    match_type: regex
+    description: "After switching to pt-BR, /credits responds in Portuguese"

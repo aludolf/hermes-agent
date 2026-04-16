@@ -130,3 +130,60 @@ def classify_contact_message(text: str) -> ClassifiedIntent | None:
         confidence=confidence,
         raw=parsed,
     )
+
+
+# ---------------------------------------------------------------------------
+# Test-trigger NL classifier (021 US5, FR-021)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# "roda o smoke test do rauru" / "executa o rauru_smoke" / "teste de onboarding"
+_TEST_TRIGGER_PATTERNS = [
+    _re.compile(r"\b(roda|rodar|executa|executar|testa|testar|run)\b", _re.IGNORECASE),
+    _re.compile(r"\b(smoke|teste|test|harness|scenario|cenário)\b", _re.IGNORECASE),
+]
+
+
+@dataclass
+class TestTriggerIntent:
+    """NL request to kick off a harness scenario."""
+    is_test_trigger: bool
+    scenario_hints: list[str]  # substrings to fuzzy-match against scenario IDs
+
+
+def classify_test_trigger(
+    text: str, *, known_scenario_ids: list[str] | None = None,
+) -> TestTriggerIntent:
+    """Quick NL matcher for owner messages like "roda o smoke test do rauru".
+
+    Two-of-two match on the trigger verb + test noun patterns classifies as
+    a test trigger. `scenario_hints` extracts candidate scenario-id tokens
+    (anything that looks like `rauru_smoke`, `smoke`, `onboarding`, etc.)
+    so the gateway can fuzzy-match against the loaded scenario cache.
+    """
+    if not text or len(text) > 300:
+        return TestTriggerIntent(is_test_trigger=False, scenario_hints=[])
+
+    verb_hit = bool(_TEST_TRIGGER_PATTERNS[0].search(text))
+    noun_hit = bool(_TEST_TRIGGER_PATTERNS[1].search(text))
+    if not (verb_hit and noun_hit):
+        return TestTriggerIntent(is_test_trigger=False, scenario_hints=[])
+
+    # Tokenize on whitespace + punctuation; preserve underscores so IDs like
+    # `rauru_smoke` survive.
+    tokens = [t.lower() for t in _re.findall(r"[\w_]+", text) if len(t) >= 3]
+    stopwords = {"roda", "rodar", "executa", "executar", "testa", "testar",
+                 "test", "smoke", "run", "teste", "harness", "the", "bot",
+                 "do", "de", "da", "pro", "com", "por", "and", "scenario",
+                 "cenário", "cenario", "um", "uma"}
+    hints = [t for t in tokens if t not in stopwords]
+    # If we know the available scenario IDs, keep only tokens that substring-match.
+    if known_scenario_ids:
+        hits = []
+        for sid in known_scenario_ids:
+            if any(tok in sid.lower() for tok in hints):
+                hits.append(sid)
+        if hits:
+            return TestTriggerIntent(is_test_trigger=True, scenario_hints=hits)
+    return TestTriggerIntent(is_test_trigger=True, scenario_hints=hints)

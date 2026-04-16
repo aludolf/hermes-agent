@@ -1,0 +1,22 @@
+id: rauru_credits_check
+name: "/credits returns valid balance + transaction history"
+category: smoke
+description: |
+  Verifies /credits replies with a balance line and either a transaction log
+  or an explicit "no transactions" marker. Catches missing-PIX-config and
+  credit-system outages early.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+preconditions:
+  - "Test user has completed onboarding"
+timeout_per_step_ms: 10000
+steps:
+  - step: 1
+    sent: "/credits@Rauru_HD_bot"
+    expected_pattern: "(credits|créditos|balance)"
+    match_type: regex
+    gate: true
+  - step: 2
+    sent: "/credits_history@Rauru_HD_bot"
+    expected_pattern: "(history|histórico|transactions|no transactions|sem transações)"
+    match_type: regex

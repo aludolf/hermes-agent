@@ -1,0 +1,27 @@
+id: rauru_stars_purchase
+name: "Telegram Stars purchase flow (sandbox)"
+category: regression
+description: |
+  Drives the Telegram Stars purchase flow — sandbox mode. Verifies the
+  bot offers star packages, emits an invoice, and (in sandbox) acknowledges
+  a simulated payment.
+target_bot: Rauru_HD_bot
+target_chat_id: "-1003992792803"
+preconditions:
+  - "RAURU_STARS_SANDBOX=1 on the Rauru deploy"
+  - "Test user has onboarded"
+timeout_per_step_ms: 20000
+steps:
+  - step: 1
+    sent: "/buy_stars@Rauru_HD_bot"
+    expected_pattern: "(stars|estrelas|package|pacote)"
+    match_type: regex
+    gate: true
+  - step: 2
+    sent: "small"
+    expected_pattern: "(invoice|pagamento|pay|checkout)"
+    match_type: regex
+  - step: 3
+    sent: "/simulate_payment"
+    expected_pattern: "(payment confirmed|pagamento confirmado|credits added|créditos adicionados)"
+    match_type: regex

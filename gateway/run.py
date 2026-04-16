@@ -666,6 +666,24 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("Reminder service init failed: %s", e)
 
+            # 021 US6: load harness scenarios from YAML at startup.
+            try:
+                from agent.orchestrator.scenario_loader import ScenarioLoader
+                scen_dir = os.getenv(
+                    "HERMES_SCENARIOS_DIR",
+                    str(Path(__file__).resolve().parents[1] / "scenarios"),
+                )
+                stats = ScenarioLoader(self._session_db).load_all_from_dir(scen_dir)
+                logger.info(
+                    "Scenario loader: %d scenarios loaded, %d skipped (from %s)",
+                    stats.loaded, stats.skipped, scen_dir,
+                )
+                if stats.errors:
+                    for err in stats.errors:
+                        logger.warning("Scenario load error: %s", err)
+            except Exception as e:
+                logger.warning("Scenario loader init failed: %s", e)
+
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
@@ -2698,6 +2716,534 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    async def _maybe_intercept_voice_extraction(
+        self,
+        *,
+        event: "MessageEvent",
+        source: "SessionSource",
+        message_text: str,
+    ) -> Optional[str]:
+        """Post-STT voice-note extraction interception (021 US1).
+
+        When the inbound event was a voice note from an owner or approved
+        contact and the STT-enriched text is short (<2000 chars), send the
+        transcript through the Sonnet extraction engine and route any
+        confident actions to their handlers.
+
+        Returns a Portuguese summary string to send back, or None to fall
+        through to the normal LLM session.
+        """
+        if self._contact_manager is None:
+            return None
+        if source.user_id is None or source.platform is None:
+            return None
+        if source.platform.value != "telegram":
+            return None
+        # Internal (system-generated) events shouldn't trigger extraction.
+        if getattr(event, "internal", False):
+            return None
+
+        # Detect voice/audio attachment on this message.
+        had_audio = False
+        if event.media_urls:
+            media_types = getattr(event, "media_types", []) or []
+            for i, _path in enumerate(event.media_urls):
+                mtype = media_types[i] if i < len(media_types) else ""
+                if mtype.startswith("audio/") or event.message_type in (
+                    MessageType.VOICE, MessageType.AUDIO,
+                ):
+                    had_audio = True
+                    break
+        if not had_audio:
+            return None
+
+        rec = self._contact_manager.get_role(source.user_id)
+        if rec is None or rec.get("role") not in ("owner", "contact"):
+            return None
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+
+        from agent.orchestrator.voice_note_pipeline import (
+            extract_voice_transcript,
+            perform_extraction,
+        )
+
+        transcript = extract_voice_transcript(message_text)
+        if not transcript:
+            return None
+
+        try:
+            outcome = await perform_extraction(
+                transcript=transcript,
+                sender_id=str(source.user_id),
+                sender_role=rec["role"],
+                sender_capabilities=capabilities,
+                sender_name=source.user_name,
+                source_type="voice_note",
+                source_format="ogg",
+                session_db=self._session_db,
+                list_manager=self._list_manager,
+                calendar_bridge=self._calendar_bridge,
+                reminder_service=self._reminder_service,
+                chat_id=str(source.chat_id) if source.chat_id else None,
+            )
+        except Exception as e:
+            logger.warning("voice extraction pipeline error: %s", e)
+            return None
+
+        if outcome is None:
+            return None
+        logger.info(
+            "voice extraction intercepted: ext=%s actions=%d",
+            outcome.extraction_id, len(outcome.routed),
+        )
+        return outcome.reply_text
+
+    async def _maybe_handle_preview_confirmation(
+        self,
+        *,
+        event: "MessageEvent",
+        source: "SessionSource",
+    ) -> Optional[str]:
+        """Resolve an active PendingPreview reply (021 US3).
+
+        Catches "confirmar" / "confirmar N, M" / "cancelar" (Portuguese,
+        case-insensitive) when the sender has an active PendingPreview.
+        Returns the reply to send on match, None to fall through.
+        """
+        if self._session_db is None or self._contact_manager is None:
+            return None
+        if source.user_id is None or source.platform is None:
+            return None
+        if source.platform.value != "telegram":
+            return None
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or len(text) > 200:
+            return None  # keep scope tight — long text is never a confirm reply
+
+        from agent.orchestrator.pending_preview import (
+            PendingPreviewManager,
+            parse_preview_reply,
+        )
+        from agent.orchestrator.action_router import RoutedHandlers
+
+        parsed = parse_preview_reply(text)
+        if parsed.kind == "unknown":
+            return None
+
+        mgr = PendingPreviewManager(self._session_db)
+        preview = mgr.get_active_preview(str(source.user_id))
+        if preview is None:
+            return None  # nothing pending — don't swallow a normal message
+
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+        handlers = RoutedHandlers(
+            list_manager=self._list_manager,
+            calendar_bridge=self._calendar_bridge,
+            reminder_service=self._reminder_service,
+        )
+
+        if parsed.kind == "cancel":
+            outcome = mgr.cancel(sender_id=str(source.user_id))
+        elif parsed.kind == "confirm_all":
+            outcome = mgr.confirm_all(
+                sender_id=str(source.user_id),
+                sender_capabilities=capabilities,
+                handlers=handlers,
+                sender_name=source.user_name,
+            )
+        elif parsed.kind == "confirm_subset":
+            outcome = mgr.confirm_subset(
+                sender_id=str(source.user_id),
+                indices=parsed.indices or [],
+                sender_capabilities=capabilities,
+                handlers=handlers,
+                sender_name=source.user_name,
+            )
+        else:  # pragma: no cover — defensive
+            return None
+
+        logger.info(
+            "preview confirmation handled: sender=%s status=%s",
+            source.user_id, outcome.status,
+        )
+        return outcome.reply_text
+
+    async def _handle_transcript_command(self, event: "MessageEvent") -> str:
+        """Handle /transcript — force-preview extraction for pasted text (021 US3).
+
+        Two invocation styles:
+        - `/transcript <text>`: the command arg is the transcript body.
+        - `/transcript` while replying to a message: use the replied-to text.
+
+        Always treats the input as long (force_preview=True) so the user sees
+        a numbered preview before anything executes. Owner-only.
+        """
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        rec = self._contact_manager.get_role(source.user_id)
+        if rec is None or rec.get("role") != "owner":
+            return "Somente o administrador pode usar /transcript."
+
+        # Extract the text body — from command args or reply-to.
+        raw = (getattr(event, "text", "") or "").strip()
+        body = ""
+        if raw.startswith("/"):
+            # Strip "/transcript" prefix
+            parts = raw.split(None, 1)
+            body = parts[1].strip() if len(parts) > 1 else ""
+
+        # Fall back to the replied-to message if args empty.
+        if not body:
+            reply_to = getattr(event, "reply_to_text", None) or getattr(event, "reply_to_message", None)
+            if isinstance(reply_to, str):
+                body = reply_to.strip()
+            elif reply_to is not None:
+                body = str(getattr(reply_to, "text", "") or "").strip()
+
+        if not body:
+            return (
+                "Uso: `/transcript <texto>` ou responda a uma mensagem com `/transcript`.\n\n"
+                "Exemplo: `/transcript reunião do dia 20 às 10h com João...`"
+            )
+
+        from agent.orchestrator.voice_note_pipeline import perform_extraction
+
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+        try:
+            outcome = await perform_extraction(
+                transcript=body,
+                sender_id=str(source.user_id),
+                sender_role="owner",
+                sender_capabilities=capabilities,
+                sender_name=source.user_name,
+                source_type="pasted_text",
+                source_format="md",
+                session_db=self._session_db,
+                list_manager=self._list_manager,
+                calendar_bridge=self._calendar_bridge,
+                reminder_service=self._reminder_service,
+                chat_id=str(source.chat_id) if source.chat_id else None,
+                force_preview=True,
+            )
+        except Exception as e:
+            logger.warning("/transcript pipeline error: %s", e)
+            return "⚠️ Não foi possível processar a transcrição."
+
+        if outcome is None:
+            return "Nenhuma ação clara foi detectada na transcrição."
+        return outcome.reply_text
+
+    def _get_harness_runner(self):
+        """Lazily-instantiated per-process HarnessRunner (021 US5).
+
+        Reuses a single runner so the per-scenario asyncio lock (FR-023) is
+        shared across /run_test invocations in the same process.
+        """
+        if getattr(self, "_harness_runner_cached", None) is not None:
+            return self._harness_runner_cached
+        if self._session_db is None:
+            return None
+        from agent.orchestrator.harness_runner import HarnessRunner
+
+        async def _send(chat_id: str, text: str):
+            # The runner doesn't know which platform to route to — for v1
+            # every scenario targets Telegram, so we use the Telegram adapter
+            # directly. If no Telegram adapter is wired (e.g. tests), fall
+            # through to any configured adapter.
+            from gateway.session_context import Platform as _Platform
+            adapter = self.adapters.get(_Platform.TELEGRAM) if hasattr(_Platform, "TELEGRAM") else None
+            if adapter is None:
+                # Fallback: pick the first available adapter.
+                adapters = list(self.adapters.values())
+                adapter = adapters[0] if adapters else None
+            if adapter is None:
+                raise RuntimeError("no adapter available for harness send")
+            await adapter.send(chat_id, text)
+
+        runner = HarnessRunner(self._session_db, send_message=_send)
+        self._harness_runner_cached = runner
+        return runner
+
+    async def _handle_run_test_command(self, event: "MessageEvent") -> str:
+        """Handle /run_test <scenario_id> — execute a harness scenario (021 US5)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /run_test."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        raw = (getattr(event, "text", "") or "").strip()
+        parts = raw.split(None, 1)
+        scenario_id = parts[1].strip() if len(parts) > 1 else ""
+        if not scenario_id:
+            return (
+                "Uso: `/run_test <scenario_id>`\n\n"
+                "Use `/scenarios` para listar os cenários disponíveis."
+            )
+
+        scen = self._session_db.get_scenario_by_id(scenario_id)
+        if scen is None:
+            return f"Cenário `{scenario_id}` não encontrado. Use `/scenarios` para listar."
+
+        # Deserialize DB row into the dict shape HarnessRunner expects.
+        import json as _json
+        try:
+            steps = _json.loads(scen["steps_json"]) if scen.get("steps_json") else []
+        except (_json.JSONDecodeError, TypeError):
+            steps = []
+        scenario = {
+            "scenario_id": scen["scenario_id"],
+            "name": scen.get("name"),
+            "category": scen.get("category"),
+            "target_bot": scen.get("target_bot"),
+            "target_chat_id": scen.get("target_chat_id"),
+            "steps": steps,
+        }
+
+        runner = self._get_harness_runner()
+        if runner is None:
+            return "⚠️ Runner indisponível."
+
+        # Fire the run in the background so we can reply immediately.
+        triggered_by = f"hermes:owner:{source.user_id}"
+
+        async def _run_and_reply():
+            try:
+                run = await runner.run_scenario(
+                    scenario, triggered_by=triggered_by,
+                    trigger_source="slash_command",
+                )
+            except Exception as e:
+                logger.warning("/run_test pipeline error: %s", e)
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id, f"⚠️ Execução falhou: {e}"
+                    )
+                return
+            # 002 lineage link.
+            try:
+                from agent.orchestrator.jobs import OrchestratorJobService
+                svc = OrchestratorJobService(self._session_db)
+                svc.track_harness_run(
+                    run_id=run.run_id, scenario_id=run.scenario_id,
+                    triggered_by=triggered_by, status=run.status,
+                    steps_count=len(run.steps),
+                )
+            except Exception as e:
+                logger.debug("harness lineage link failed: %s", e)
+
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                emoji = {"pass": "✅", "fail": "❌", "timeout": "⏱️", "error": "⚠️"}.get(run.status, "•")
+                lines = [
+                    f"{emoji} **{run.scenario_name}** — {run.status.upper()} "
+                    f"({run.duration_ms}ms)",
+                ]
+                for s in run.steps:
+                    mark = {"pass": "✓", "fail": "✗", "timeout": "⏱", "skipped": "—", "error": "⚠"}.get(s.status, "?")
+                    lines.append(f"  {mark} {s.step}. {s.sent[:40]}  ({s.duration_ms}ms)")
+                if run.regression_flags:
+                    lines.append(f"⚠️ Regressão nas etapas: {run.regression_flags}")
+                await adapter.send(source.chat_id, "\n".join(lines))
+
+        # Track the background task so it isn't GC'd mid-run.
+        task = asyncio.create_task(_run_and_reply())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        return f"▶️ Executando `{scenario_id}`… aguardando resposta de {scen.get('target_bot')}."
+
+    async def _handle_scenarios_command(self, event: "MessageEvent") -> str:
+        """Handle /scenarios — list available harness scenarios (owner only)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /scenarios."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        rows = self._session_db.list_scenarios()
+        if not rows:
+            return (
+                "Nenhum cenário carregado.\n"
+                "Adicione um `.yaml` em `scenarios/` e refaça o deploy."
+            )
+        lines = [f"🧪 **Cenários carregados** ({len(rows)})"]
+        for r in rows:
+            dur = r.get("estimated_duration_ms") or 0
+            lines.append(
+                f"  • `{r['scenario_id']}` — {r.get('name')} "
+                f"({r.get('category')}, ~{int(dur / 1000)}s)"
+            )
+        return "\n".join(lines)
+
+    async def _handle_test_history_command(self, event: "MessageEvent") -> str:
+        """Handle /test_history [scenario_id] — recent harness runs."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /test_history."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        raw = (getattr(event, "text", "") or "").strip()
+        parts = raw.split(None, 1)
+        scenario_id = parts[1].strip() if len(parts) > 1 else None
+
+        if scenario_id:
+            runs = self._session_db.list_harness_runs_by_scenario(
+                scenario_id, limit=20,
+            )
+            header = f"📜 **Histórico — {scenario_id}** ({len(runs)} últimas execuções)"
+        else:
+            runs = self._session_db.list_harness_runs(limit=20)
+            header = f"📜 **Histórico** ({len(runs)} últimas execuções)"
+
+        if not runs:
+            return "Nenhuma execução encontrada."
+
+        from datetime import datetime, timezone, timedelta
+        brt = timezone(timedelta(hours=-3))
+        lines = [header]
+        for r in runs:
+            when = datetime.fromtimestamp(
+                r.get("started_at") or 0, tz=brt,
+            ).strftime("%Y-%m-%d %H:%M")
+            emoji = {"pass": "✅", "fail": "❌", "timeout": "⏱️", "error": "⚠️"}.get(
+                r.get("status", ""), "•",
+            )
+            lines.append(
+                f"  {emoji} {when} — `{r['scenario_id']}` "
+                f"({r.get('status')}, {r.get('duration_ms') or 0}ms)"
+            )
+        return "\n".join(lines)
+
+    async def _handle_entity_command(self, event: "MessageEvent") -> str:
+        """Handle /entity <name> — show accumulated context (owner only, 021 US4)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /entity."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        text = (getattr(event, "text", "") or "").strip()
+        parts = text.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            return (
+                "Uso: `/entity <nome>`\n\n"
+                "Exemplo: `/entity João`"
+            )
+        name = parts[1].strip()
+
+        from agent.orchestrator.entity_context import EntityContextManager
+        mgr = EntityContextManager(self._session_db)
+        return mgr.format_entity_summary(name)
+
+    async def _handle_entities_command(self, event: "MessageEvent") -> str:
+        """Handle /entities — list known entities (owner only, 021 US4)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /entities."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        from agent.orchestrator.entity_context import EntityContextManager
+        mgr = EntityContextManager(self._session_db)
+        return mgr.format_entity_list()
+
+    async def _maybe_intercept_document_extraction(
+        self,
+        *,
+        event: "MessageEvent",
+        source: "SessionSource",
+    ) -> Optional[str]:
+        """Post-upload document extraction interception (021 US2).
+
+        If the inbound event is a Telegram DOCUMENT from an owner/contact
+        and carries a MarkItDown-supported file, convert it to markdown and
+        run it through the extraction pipeline. Long documents (>2000 chars
+        of extracted text) are forced through the preview flow (US3).
+        """
+        if self._contact_manager is None:
+            return None
+        if source.user_id is None or source.platform is None:
+            return None
+        if source.platform.value != "telegram":
+            return None
+        if getattr(event, "internal", False):
+            return None
+        if event.message_type != MessageType.DOCUMENT:
+            return None
+        if not event.media_urls:
+            return None
+
+        from agent.orchestrator.document_converter import DocumentConverter
+        from agent.orchestrator.voice_note_pipeline import perform_extraction
+
+        rec = self._contact_manager.get_role(source.user_id)
+        if rec is None or rec.get("role") not in ("owner", "contact"):
+            return None
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+
+        converter = DocumentConverter()
+        # Pick the first supported attachment; ignore the rest (rare case).
+        chosen_path: Optional[str] = None
+        for i, path in enumerate(event.media_urls):
+            if converter.can_convert(path):
+                chosen_path = path
+                break
+        if chosen_path is None:
+            return None
+
+        import asyncio as _asyncio
+        try:
+            markdown = await _asyncio.to_thread(converter.convert, chosen_path)
+        except Exception as e:
+            logger.warning("document convert raised: %s", e)
+            return None
+        if not markdown:
+            return None
+
+        from pathlib import Path as _Path
+        source_format = _Path(chosen_path).suffix.lower().lstrip(".") or None
+
+        try:
+            outcome = await perform_extraction(
+                transcript=markdown,
+                sender_id=str(source.user_id),
+                sender_role=rec["role"],
+                sender_capabilities=capabilities,
+                sender_name=source.user_name,
+                source_type="document_upload",
+                source_format=source_format,
+                session_db=self._session_db,
+                list_manager=self._list_manager,
+                calendar_bridge=self._calendar_bridge,
+                reminder_service=self._reminder_service,
+                chat_id=str(source.chat_id) if source.chat_id else None,
+            )
+        except Exception as e:
+            logger.warning("document extraction pipeline error: %s", e)
+            return None
+
+        if outcome is None:
+            return None
+        logger.info(
+            "document extraction intercepted: ext=%s actions=%d mode=%s",
+            outcome.extraction_id, len(outcome.routed), outcome.execution_mode,
+        )
+        return outcome.reply_text
+
     async def _handle_contact_list_intent(self, event: "MessageEvent") -> Optional[str]:
         """Try to handle a contact's message as a list operation (no LLM).
 
@@ -3168,6 +3714,24 @@ class GatewayRunner:
                 _contact_role_allowed = True
                 _contact_role_is_contact = (role == "contact")
 
+                # 021 US3: preview-confirmation reply handler. Catches
+                # "confirmar" / "confirmar N, M" / "cancelar" from any owner
+                # or contact with an active PendingPreview. Runs BEFORE the
+                # contact list intent so it isn't misclassified as a list op.
+                if not (event.text or "").startswith("/"):
+                    try:
+                        _preview_reply = await self._maybe_handle_preview_confirmation(
+                            event=event, source=source,
+                        )
+                    except Exception as _e:
+                        logger.debug("preview confirmation failed: %s", _e)
+                        _preview_reply = None
+                    if _preview_reply is not None:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(source.chat_id, _preview_reply)
+                        return None
+
                 # For contacts, try deterministic NL list intent BEFORE
                 # spawning an LLM session. Cheap, fast, no token burn.
                 if _contact_role_is_contact and not (event.text or "").startswith("/"):
@@ -3354,6 +3918,18 @@ class GatewayRunner:
                 return await self._handle_done_command(event)
             if event.get_command() == "recados":
                 return await self._handle_recados_command(event)
+            if event.get_command() == "transcript":
+                return await self._handle_transcript_command(event)
+            if event.get_command() == "entity":
+                return await self._handle_entity_command(event)
+            if event.get_command() == "entities":
+                return await self._handle_entities_command(event)
+            if event.get_command() == "run_test":
+                return await self._handle_run_test_command(event)
+            if event.get_command() == "scenarios":
+                return await self._handle_scenarios_command(event)
+            if event.get_command() == "test_history":
+                return await self._handle_test_history_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3543,6 +4119,18 @@ class GatewayRunner:
             return await self._handle_done_command(event)
         if canonical == "recados":
             return await self._handle_recados_command(event)
+        if canonical == "transcript":
+            return await self._handle_transcript_command(event)
+        if canonical == "entity":
+            return await self._handle_entity_command(event)
+        if canonical == "entities":
+            return await self._handle_entities_command(event)
+        if canonical == "run_test":
+            return await self._handle_run_test_command(event)
+        if canonical == "scenarios":
+            return await self._handle_scenarios_command(event)
+        if canonical == "test_history":
+            return await self._handle_test_history_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -4406,6 +4994,38 @@ class GatewayRunner:
             history=history,
         )
         if message_text is None:
+            return
+
+        # 021: post-STT voice-note extraction interception.
+        # Owners and approved contacts sending a voice note get their
+        # transcript passed through the Sonnet-based extraction engine BEFORE
+        # an agent session spawns. On success, we reply in Portuguese with
+        # the routed actions and skip the LLM entirely.
+        _intercept_reply = await self._maybe_intercept_voice_extraction(
+            event=event, source=source, message_text=message_text,
+        )
+        if _intercept_reply is not None:
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                try:
+                    await adapter.send(source.chat_id, _intercept_reply)
+                except Exception as e:
+                    logger.warning("voice extraction reply send failed: %s", e)
+            return
+
+        # 021 US2: document-upload extraction interception.
+        # MarkItDown-convertible uploads (Word/Excel/PPT/PDF/etc.) go through
+        # the same Sonnet pipeline as voice notes, routed before the LLM.
+        _doc_reply = await self._maybe_intercept_document_extraction(
+            event=event, source=source,
+        )
+        if _doc_reply is not None:
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                try:
+                    await adapter.send(source.chat_id, _doc_reply)
+                except Exception as e:
+                    logger.warning("document extraction reply send failed: %s", e)
             return
 
         try:
