@@ -263,6 +263,39 @@ def test_pipeline_rejects_unknown_sender_role(tmp_path):
         db.close()
 
 
+def test_pipeline_accumulates_entities_from_extraction(tmp_path):
+    """US4: entities_mentioned in ExtractionResult → entity_context rows."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    lm, cal, rem = _fake_handlers()
+    result = ExtractionResult(
+        actions=[ExtractedAction(
+            action_type="task", content="café", confidence=0.95,
+            metadata={"list": "Compras"},
+        )],
+        entities_mentioned=["João", "contador"],
+        summary="1 item, 2 pessoas mencionadas",
+        transcript_hash="",
+    )
+    try:
+        _run(perform_extraction(
+            transcript="Comprar café, ligar pro João ou o contador",
+            sender_id="owner",
+            sender_role="owner",
+            sender_capabilities={"all"},
+            session_db=db,
+            list_manager=lm, calendar_bridge=cal, reminder_service=rem,
+            extract_fn=_fake_extract_factory(result),
+        ))
+        joao = db.get_entity_by_name("João")
+        contador = db.get_entity_by_name("contador")
+        assert joao is not None
+        assert contador is not None
+        assert joao["mention_count"] == 1
+        assert contador["mention_count"] == 1
+    finally:
+        db.close()
+
+
 def test_pipeline_long_input_persists_pending_preview(tmp_path):
     """US3: long transcript + chat_id → pending_previews row created."""
     db = SessionDB(db_path=tmp_path / "state.db")

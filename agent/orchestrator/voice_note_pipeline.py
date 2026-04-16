@@ -30,6 +30,7 @@ from .action_router import (
     new_preview_id,
     route_actions,
 )
+from .entity_context import EntityContextManager
 from .extraction import (
     ExtractionResult,
     compute_transcript_hash,
@@ -248,6 +249,21 @@ async def perform_extraction(
     execution_mode = "preview" if long_input else "auto"
     extraction_id = new_extraction_id()
     transcript_preview = transcript[:500]
+
+    # US4: accumulate entity context from the extraction result.
+    if session_db is not None and result.entities_mentioned:
+        try:
+            ent_mgr = EntityContextManager(session_db)
+            # Reuse the transcript preview as the snippet so users can see
+            # the surrounding context when querying `/entity <name>`.
+            for name in result.entities_mentioned:
+                ent_mgr.update_context(
+                    name=name,
+                    context_snippet=transcript_preview,
+                    source_extraction_id=extraction_id,
+                )
+        except Exception as e:
+            logger.warning("pipeline: entity context update failed: %s", e)
 
     if session_db is not None:
         try:

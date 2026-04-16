@@ -2916,6 +2916,43 @@ class GatewayRunner:
             return "Nenhuma ação clara foi detectada na transcrição."
         return outcome.reply_text
 
+    async def _handle_entity_command(self, event: "MessageEvent") -> str:
+        """Handle /entity <name> — show accumulated context (owner only, 021 US4)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /entity."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        text = (getattr(event, "text", "") or "").strip()
+        parts = text.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            return (
+                "Uso: `/entity <nome>`\n\n"
+                "Exemplo: `/entity João`"
+            )
+        name = parts[1].strip()
+
+        from agent.orchestrator.entity_context import EntityContextManager
+        mgr = EntityContextManager(self._session_db)
+        return mgr.format_entity_summary(name)
+
+    async def _handle_entities_command(self, event: "MessageEvent") -> str:
+        """Handle /entities — list known entities (owner only, 021 US4)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /entities."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+
+        from agent.orchestrator.entity_context import EntityContextManager
+        mgr = EntityContextManager(self._session_db)
+        return mgr.format_entity_list()
+
     async def _maybe_intercept_document_extraction(
         self,
         *,
@@ -3675,6 +3712,10 @@ class GatewayRunner:
                 return await self._handle_recados_command(event)
             if event.get_command() == "transcript":
                 return await self._handle_transcript_command(event)
+            if event.get_command() == "entity":
+                return await self._handle_entity_command(event)
+            if event.get_command() == "entities":
+                return await self._handle_entities_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -3866,6 +3907,10 @@ class GatewayRunner:
             return await self._handle_recados_command(event)
         if canonical == "transcript":
             return await self._handle_transcript_command(event)
+        if canonical == "entity":
+            return await self._handle_entity_command(event)
+        if canonical == "entities":
+            return await self._handle_entities_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)

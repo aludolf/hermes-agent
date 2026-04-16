@@ -21,6 +21,7 @@ from .document_converter import (
     MAX_FILE_SIZE_BYTES as DOCUMENT_MAX_FILE_SIZE_BYTES,
     SUPPORTED_EXTENSIONS as DOCUMENT_SUPPORTED_EXTENSIONS,
 )
+from .entity_context import EntityContextManager
 from .extraction import (
     ExtractedAction,
     ExtractionResult,
@@ -100,6 +101,7 @@ __all__ = [
     "DOCUMENT_MAX_FILE_SIZE_BYTES",
     "DOCUMENT_SUPPORTED_EXTENSIONS",
     "DocumentConverter",
+    "EntityContextManager",
     "EntityType",
     "ExecutionMode",
     "ExtractedAction",
