@@ -16,6 +16,11 @@ from .action_router import (
 from .briefing import BriefingBuilder
 from .calendar_bridge import CalendarBridge, parse_portuguese_datetime
 from .contacts import ContactManager
+from .document_converter import (
+    DocumentConverter,
+    MAX_FILE_SIZE_BYTES as DOCUMENT_MAX_FILE_SIZE_BYTES,
+    SUPPORTED_EXTENSIONS as DOCUMENT_SUPPORTED_EXTENSIONS,
+)
 from .extraction import (
     ExtractedAction,
     ExtractionResult,
@@ -85,6 +90,9 @@ __all__ = [
     "ConsumptionMode",
     "ContactManager",
     "ContactRole",
+    "DOCUMENT_MAX_FILE_SIZE_BYTES",
+    "DOCUMENT_SUPPORTED_EXTENSIONS",
+    "DocumentConverter",
     "EntityType",
     "ExecutionMode",
     "ExtractedAction",

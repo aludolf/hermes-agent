@@ -2779,6 +2779,88 @@ class GatewayRunner:
         )
         return outcome.reply_text
 
+    async def _maybe_intercept_document_extraction(
+        self,
+        *,
+        event: "MessageEvent",
+        source: "SessionSource",
+    ) -> Optional[str]:
+        """Post-upload document extraction interception (021 US2).
+
+        If the inbound event is a Telegram DOCUMENT from an owner/contact
+        and carries a MarkItDown-supported file, convert it to markdown and
+        run it through the extraction pipeline. Long documents (>2000 chars
+        of extracted text) are forced through the preview flow (US3).
+        """
+        if self._contact_manager is None:
+            return None
+        if source.user_id is None or source.platform is None:
+            return None
+        if source.platform.value != "telegram":
+            return None
+        if getattr(event, "internal", False):
+            return None
+        if event.message_type != MessageType.DOCUMENT:
+            return None
+        if not event.media_urls:
+            return None
+
+        from agent.orchestrator.document_converter import DocumentConverter
+        from agent.orchestrator.voice_note_pipeline import perform_extraction
+
+        rec = self._contact_manager.get_role(source.user_id)
+        if rec is None or rec.get("role") not in ("owner", "contact"):
+            return None
+        capabilities = self._contact_manager.get_capabilities(source.user_id)
+
+        converter = DocumentConverter()
+        # Pick the first supported attachment; ignore the rest (rare case).
+        chosen_path: Optional[str] = None
+        for i, path in enumerate(event.media_urls):
+            if converter.can_convert(path):
+                chosen_path = path
+                break
+        if chosen_path is None:
+            return None
+
+        import asyncio as _asyncio
+        try:
+            markdown = await _asyncio.to_thread(converter.convert, chosen_path)
+        except Exception as e:
+            logger.warning("document convert raised: %s", e)
+            return None
+        if not markdown:
+            return None
+
+        from pathlib import Path as _Path
+        source_format = _Path(chosen_path).suffix.lower().lstrip(".") or None
+
+        try:
+            outcome = await perform_extraction(
+                transcript=markdown,
+                sender_id=str(source.user_id),
+                sender_role=rec["role"],
+                sender_capabilities=capabilities,
+                sender_name=source.user_name,
+                source_type="document_upload",
+                source_format=source_format,
+                session_db=self._session_db,
+                list_manager=self._list_manager,
+                calendar_bridge=self._calendar_bridge,
+                reminder_service=self._reminder_service,
+            )
+        except Exception as e:
+            logger.warning("document extraction pipeline error: %s", e)
+            return None
+
+        if outcome is None:
+            return None
+        logger.info(
+            "document extraction intercepted: ext=%s actions=%d mode=%s",
+            outcome.extraction_id, len(outcome.routed), outcome.execution_mode,
+        )
+        return outcome.reply_text
+
     async def _handle_contact_list_intent(self, event: "MessageEvent") -> Optional[str]:
         """Try to handle a contact's message as a list operation (no LLM).
 
@@ -4504,6 +4586,21 @@ class GatewayRunner:
                     await adapter.send(source.chat_id, _intercept_reply)
                 except Exception as e:
                     logger.warning("voice extraction reply send failed: %s", e)
+            return
+
+        # 021 US2: document-upload extraction interception.
+        # MarkItDown-convertible uploads (Word/Excel/PPT/PDF/etc.) go through
+        # the same Sonnet pipeline as voice notes, routed before the LLM.
+        _doc_reply = await self._maybe_intercept_document_extraction(
+            event=event, source=source,
+        )
+        if _doc_reply is not None:
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                try:
+                    await adapter.send(source.chat_id, _doc_reply)
+                except Exception as e:
+                    logger.warning("document extraction reply send failed: %s", e)
             return
 
         try:

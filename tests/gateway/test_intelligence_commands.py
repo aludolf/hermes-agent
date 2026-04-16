@@ -263,6 +263,30 @@ def test_pipeline_rejects_unknown_sender_role(tmp_path):
         db.close()
 
 
+def test_pipeline_document_source_type_is_recorded(tmp_path):
+    """US2: a document_upload pipeline run persists source_type correctly."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    lm, cal, rem = _fake_handlers()
+    try:
+        outcome = _run(perform_extraction(
+            transcript="# Ações\n- comprar pão\n- reunião sexta",
+            sender_id="s1",
+            sender_role="owner",
+            sender_capabilities={"all"},
+            source_type="document_upload",
+            source_format="docx",
+            session_db=db,
+            list_manager=lm, calendar_bridge=cal, reminder_service=rem,
+            extract_fn=_fake_extract_factory(_task_result(0.95)),
+        ))
+        assert outcome is not None
+        events = db.list_extraction_events(sender_id="s1")
+        assert events[0]["source_type"] == "document_upload"
+        assert events[0]["source_format"] == "docx"
+    finally:
+        db.close()
+
+
 def test_pipeline_filters_action_for_lists_only_contact(tmp_path):
     """Contact with lists-only capability: meeting action must be filtered."""
     db = SessionDB(db_path=tmp_path / "state.db")
