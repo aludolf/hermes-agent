@@ -97,6 +97,7 @@ from .teams_webhook import handle_ms_graph_webhook
 from .sentinel_queue import ExtractionItem, SentinelExtractionQueue
 from .email_auth import app_password_login_args, xoauth2_build_sasl_string, refresh_xoauth2_access_token
 from .email_sentinel import EmailSentinel, EmailSentinelError
+from .email_backfill import BackfillRunner, TokenBucketRateLimiter
 from .reporting import format_job_summary, format_job_summary_list
 from .router import classify_route
 from .storage import (
@@ -213,4 +214,6 @@ __all__ = [
     "refresh_xoauth2_access_token",
     "EmailSentinel",
     "EmailSentinelError",
+    "BackfillRunner",
+    "TokenBucketRateLimiter",
 ]

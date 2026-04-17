@@ -12,11 +12,8 @@ every 60 s, tracking the latest message timestamp as a cursor.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import time
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +137,19 @@ class TeamsSentinel:
             mute = watch["mute_until"]
             if mute == 0 or time.time() < mute:
                 logger.debug("Muted watch %s — skipping notification", watch_id)
+                return
+        # Quiet hours: suppress during configured UTC hour range
+        qh_start = watch.get("quiet_hours_start")
+        qh_end = watch.get("quiet_hours_end")
+        if qh_start is not None and qh_end is not None:
+            import datetime as _dt
+            current_hour = _dt.datetime.now(_dt.timezone.utc).hour
+            if qh_start <= qh_end:
+                in_quiet = qh_start <= current_hour < qh_end
+            else:  # spans midnight
+                in_quiet = current_hour >= qh_start or current_hour < qh_end
+            if in_quiet:
+                logger.debug("Quiet hours active for watch %s — skipping notification", watch_id)
                 return
         message_text = await self._fetch_message_text(watch, resource_id, payload)
         if not message_text:
@@ -327,8 +337,6 @@ class TeamsSentinel:
         base = os.getenv("HERMES_WEBHOOK_BASE_URL", "").rstrip("/")
         return f"{base}/webhooks/ms-graph"
 
-
-import os
 
 
 # ------------------------------------------------------------------

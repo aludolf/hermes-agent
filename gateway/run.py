@@ -3548,17 +3548,36 @@ class GatewayRunner:
         return f"🔄 Backfill iniciado para *{alias}*{since_note} — job `{job_id}`."
 
     async def _run_backfill_job(self, job_id: str, acct: dict, since: Optional[str]) -> None:
-        """Background task that runs the email backfill job (022 US3 stub)."""
+        """Background task that runs the email backfill job (022 US3)."""
         if self._session_db is None:
             return
-        self._session_db.start_backfill_job(job_id, total_estimated=0)
+        from agent.orchestrator.email_backfill import BackfillRunner
+
+        store = self._get_sentinel_credentials_store()
+        if store is None:
+            self._session_db.fail_backfill_job(job_id, "HERMES_MASTER_KEY not set")
+            return
+
+        async def _notify(msg: str) -> None:
+            try:
+                owner_id = self._owner_id or acct.get("owner_id", "")
+                if owner_id and hasattr(self, "_send_message"):
+                    await self._send_message(chat_id=owner_id, text=msg)
+            except Exception:
+                pass
+
+        runner = BackfillRunner(
+            session_db=self._session_db,
+            extraction_queue=self._sentinel_queue,
+            credentials_store=store,
+            notify_fn=_notify,
+        )
         try:
-            # Full backfill implementation is in Phase 5 (BackfillRunner).
-            # This stub marks the job as completed immediately.
-            logger.info("Backfill job %s started (stub — BackfillRunner not yet implemented)", job_id)
-            self._session_db.complete_backfill_job(job_id)
+            await runner.run(job_id)
+        except asyncio.CancelledError:
+            logger.info("Backfill job %s cancelled", job_id)
         except Exception as exc:
-            logger.exception("Backfill job %s failed: %s", job_id, exc)
+            logger.exception("Backfill job %s unhandled error: %s", job_id, exc)
             self._session_db.fail_backfill_job(job_id, str(exc))
 
     async def _handle_email_backfill_status_command(self, event: "MessageEvent") -> str:
@@ -3597,6 +3616,97 @@ class GatewayRunner:
                 pct = f" ({j.get('processed_count', 0)}/{j['total_estimated']})"
             lines.append(f"{emoji} `{j['job_id']}`{pct} — {j.get('state', '?')}")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Phase 6 — Noise controls (022 US4)
+    # ------------------------------------------------------------------
+
+    async def _handle_teams_mute_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_mute <alias|watch_id> [hours] — mute a Teams watch."""
+        source = event.source
+        if not self._contact_manager or not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_mute."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        args = event.get_command_args().strip().split()
+        if not args:
+            return "Uso: `/teams_mute <alias> [horas]`"
+        alias = args[0]
+        hours = None
+        if len(args) > 1:
+            try:
+                hours = float(args[1])
+            except ValueError:
+                return "Número de horas inválido."
+        owner_id = str(source.user_id)
+        watches = self._session_db.list_teams_watches(owner_id=owner_id)
+        watch = next(
+            (w for w in watches if w.get("alias") == alias or w.get("watch_id") == alias),
+            None,
+        )
+        if not watch:
+            return f"Watch *{alias}* não encontrado."
+        mute_until = 0.0 if hours is None else time.time() + hours * 3600
+        self._session_db.set_teams_watch_mute(watch["watch_id"], mute_until=mute_until)
+        if hours:
+            return f"🔕 Watch *{alias}* silenciado por {hours:.0f}h."
+        return f"🔕 Watch *{alias}* silenciado indefinidamente. Use /teams_unmute para reativar."
+
+    async def _handle_teams_unmute_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_unmute <alias|watch_id> — remove mute."""
+        source = event.source
+        if not self._contact_manager or not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_unmute."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        alias = event.get_command_args().strip()
+        if not alias:
+            return "Uso: `/teams_unmute <alias>`"
+        owner_id = str(source.user_id)
+        watches = self._session_db.list_teams_watches(owner_id=owner_id)
+        watch = next(
+            (w for w in watches if w.get("alias") == alias or w.get("watch_id") == alias),
+            None,
+        )
+        if not watch:
+            return f"Watch *{alias}* não encontrado."
+        self._session_db.set_teams_watch_mute(watch["watch_id"], mute_until=None)
+        return f"🔔 Watch *{alias}* reativado."
+
+    async def _handle_teams_quiet_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_quiet <alias> <HH-HH> — set daily quiet hours (UTC)."""
+        source = event.source
+        if not self._contact_manager or not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_quiet."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        args = event.get_command_args().strip().split()
+        if len(args) < 2:
+            return "Uso: `/teams_quiet <alias> <HH-HH>` (ex: 22-08 para 22h até 8h UTC)"
+        alias = args[0]
+        time_range = args[1]
+        try:
+            start_s, end_s = time_range.split("-", 1)
+            start_h = int(start_s)
+            end_h = int(end_s)
+            if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
+                raise ValueError
+        except ValueError:
+            return "Formato inválido. Use `HH-HH` (ex: `22-08`)."
+        owner_id = str(source.user_id)
+        watches = self._session_db.list_teams_watches(owner_id=owner_id)
+        watch = next(
+            (w for w in watches if w.get("alias") == alias or w.get("watch_id") == alias),
+            None,
+        )
+        if not watch:
+            return f"Watch *{alias}* não encontrado."
+        self._session_db.set_teams_watch_mute(
+            watch["watch_id"],
+            quiet_hours_start=start_h,
+            quiet_hours_end=end_h,
+        )
+        return f"🌙 Quiet hours de *{alias}* configuradas: {start_h:02d}h–{end_h:02d}h UTC."
 
     async def _maybe_intercept_document_extraction(
         self,
@@ -4391,6 +4501,12 @@ class GatewayRunner:
                 return await self._handle_email_backfill_command(event)
             if event.get_command() == "email_backfill_status":
                 return await self._handle_email_backfill_status_command(event)
+            if event.get_command() == "teams_mute":
+                return await self._handle_teams_mute_command(event)
+            if event.get_command() == "teams_unmute":
+                return await self._handle_teams_unmute_command(event)
+            if event.get_command() == "teams_quiet":
+                return await self._handle_teams_quiet_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -4616,6 +4732,12 @@ class GatewayRunner:
             return await self._handle_email_backfill_command(event)
         if canonical == "email_backfill_status":
             return await self._handle_email_backfill_status_command(event)
+        if canonical == "teams_mute":
+            return await self._handle_teams_mute_command(event)
+        if canonical == "teams_unmute":
+            return await self._handle_teams_unmute_command(event)
+        if canonical == "teams_quiet":
+            return await self._handle_teams_quiet_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
