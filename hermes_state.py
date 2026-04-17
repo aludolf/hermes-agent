@@ -2994,6 +2994,14 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def find_teams_watch_by_client_state(self, client_state: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM teams_watches WHERE client_state = ?",
+                (client_state,),
+            ).fetchone()
+            return dict(row) if row else None
+
     # =========================================================================
     # 022 Sentinels: mail_accounts
     # =========================================================================

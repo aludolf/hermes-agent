@@ -687,7 +687,7 @@ class GatewayRunner:
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
-        
+
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
@@ -697,6 +697,13 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+        # 022 Sentinels — initialized lazily in start()
+        self._teams_sentinel = None
+        self._email_sentinel = None
+        self._credentials_store_cached = None
+        self._teams_auth_cached = None
+        self._sentinel_queue = None
 
 
 
@@ -2044,6 +2051,10 @@ class GatewayRunner:
         # Start background session expiry watcher for proactive memory flushing
         asyncio.create_task(self._session_expiry_watcher())
 
+        # 022: Start sentinel services if enabled and DB is available
+        if os.getenv("HERMES_SENTINELS_ENABLED", "1") not in ("0", "false", "no") and self._session_db is not None:
+            await self._start_sentinels()
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -2057,6 +2068,77 @@ class GatewayRunner:
         
         return True
     
+    async def _start_sentinels(self) -> None:
+        """Initialize and start Teams + Email sentinel services (022)."""
+        import os
+        owner_id = str(os.getenv("HERMES_OWNER_TELEGRAM_ID", ""))
+        if not owner_id:
+            logger.debug("HERMES_OWNER_TELEGRAM_ID not set — skipping sentinel startup")
+            return
+        cs = self._get_sentinel_credentials_store()
+        if cs is None:
+            logger.info("HERMES_MASTER_KEY not set — sentinels disabled (credentials store unavailable)")
+            return
+
+        # Build shared extraction queue
+        from agent.orchestrator.sentinel_queue import ExtractionItem, SentinelExtractionQueue
+        from agent.orchestrator.voice_note_pipeline import perform_extraction
+
+        async def _extraction_fn(item: ExtractionItem):
+            try:
+                return await perform_extraction(
+                    transcript=item.transcript,
+                    sender_id=item.sender_id,
+                    sender_role=item.sender_role,
+                    sender_capabilities=item.sender_capabilities,
+                    source_type=item.source_type,
+                    source_format=item.source_format,
+                    session_db=self._session_db,
+                    suppress_action_routing=item.suppress_action_routing,
+                    execution_mode_override=item.execution_mode_override,
+                    **item.extra_kwargs,
+                )
+            except Exception as exc:
+                logger.exception("Sentinel extraction error: %s", exc)
+                return None
+
+        self._sentinel_queue = SentinelExtractionQueue(
+            session_db=self._session_db,
+            extraction_fn=_extraction_fn,
+        )
+        await self._sentinel_queue.start()
+
+        # Teams sentinel
+        try:
+            auth = self._get_teams_auth_manager()
+            if auth and auth.has_credentials():
+                from agent.orchestrator.teams_sentinel import TeamsSentinel
+                self._teams_sentinel = TeamsSentinel(
+                    session_db=self._session_db,
+                    auth_manager=auth,
+                    extraction_queue=self._sentinel_queue,
+                    owner_id=owner_id,
+                )
+                await self._teams_sentinel.start()
+                logger.info("TeamsSentinel started")
+            else:
+                logger.info("Teams sentinel: no credentials — run /teams_connect to authenticate")
+        except Exception as exc:
+            logger.warning("TeamsSentinel startup failed: %s", exc)
+
+        # Email sentinel
+        try:
+            from agent.orchestrator.email_sentinel import EmailSentinel
+            self._email_sentinel = EmailSentinel(
+                session_db=self._session_db,
+                extraction_queue=self._sentinel_queue,
+                owner_id=owner_id,
+            )
+            await self._email_sentinel.start()
+            logger.info("EmailSentinel started")
+        except Exception as exc:
+            logger.warning("EmailSentinel startup failed: %s", exc)
+
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that proactively flushes memories for expired sessions.
         
@@ -3161,6 +3243,361 @@ class GatewayRunner:
         mgr = EntityContextManager(self._session_db)
         return mgr.format_entity_list()
 
+    # =========================================================================
+    # 022 Teams sentinel command handlers
+    # =========================================================================
+
+    def _get_sentinel_credentials_store(self):
+        """Return a CredentialsStore for the running gateway, lazily initialized."""
+        if getattr(self, "_credentials_store_cached", None) is not None:
+            return self._credentials_store_cached
+        import os
+        if self._session_db is None:
+            return None
+        try:
+            from agent.orchestrator.credentials import CredentialsStore
+            master_key = os.getenv("HERMES_MASTER_KEY", "")
+            if not master_key:
+                return None
+            cs = CredentialsStore(self._session_db, master_key=master_key)
+            self._credentials_store_cached = cs
+            return cs
+        except Exception as exc:
+            logger.warning("CredentialsStore init failed: %s", exc)
+            return None
+
+    def _get_teams_auth_manager(self):
+        if getattr(self, "_teams_auth_cached", None) is not None:
+            return self._teams_auth_cached
+        cs = self._get_sentinel_credentials_store()
+        if cs is None:
+            return None
+        try:
+            from agent.orchestrator.teams_auth import TeamsAuthManager
+            mgr = TeamsAuthManager(cs)
+            self._teams_auth_cached = mgr
+            return mgr
+        except Exception as exc:
+            logger.warning("TeamsAuthManager init failed: %s", exc)
+            return None
+
+    async def _handle_teams_connect_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_connect — start Microsoft device-code auth flow (022 US1)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_connect."
+        auth = self._get_teams_auth_manager()
+        if auth is None:
+            return "⚠️ HERMES_MASTER_KEY não configurado — não é possível armazenar credenciais."
+        try:
+            flow = auth.start_device_code_flow()
+            return (
+                f"🔐 *Conectar Microsoft Teams*\n\n"
+                f"Acesse: {flow['verification_uri']}\n"
+                f"Código: `{flow['user_code']}`\n\n"
+                f"Digite o código acima e aguarde a confirmação.\n"
+                f"_(este fluxo expira em ~15 minutos)_"
+            )
+        except Exception as exc:
+            logger.exception("/teams_connect error")
+            return f"❌ Erro ao iniciar autenticação: {exc}"
+
+    async def _handle_teams_watch_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_watch <resource_id> [alias] — add a Teams watch (022 US1)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_watch."
+        args = event.get_command_args().strip().split()
+        if not args:
+            return "Uso: `/teams_watch <resource_id> [alias]`"
+        resource_id = args[0]
+        alias = args[1] if len(args) > 1 else ""
+        sentinel = getattr(self, "_teams_sentinel", None)
+        if sentinel is None:
+            return "⚠️ Sentinel Teams não está ativo (HERMES_SENTINELS_ENABLED=0 ou sem credenciais)."
+        try:
+            watch = await sentinel.watch_resource("chat", resource_id, alias)
+            mode = watch.get("delivery_mode", "polling")
+            return (
+                f"✅ Monitorando `{resource_id}` "
+                f"({'🔔 tempo real' if mode == 'realtime' else '⏱ polling 60s'})"
+                f"{f' como *{alias}*' if alias else ''}"
+            )
+        except Exception as exc:
+            logger.exception("/teams_watch error")
+            return f"❌ Erro ao adicionar watch: {exc}"
+
+    async def _handle_teams_unwatch_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_unwatch <watch_id_or_alias> — remove a Teams watch (022 US1)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_unwatch."
+        arg = event.get_command_args().strip()
+        if not arg:
+            return "Uso: `/teams_unwatch <watch_id>`"
+        sentinel = getattr(self, "_teams_sentinel", None)
+        if sentinel is None:
+            return "⚠️ Sentinel Teams não está ativo."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        watch = self._session_db.get_teams_watch(arg)
+        if not watch:
+            return f"Watch `{arg}` não encontrado."
+        try:
+            await sentinel.unwatch(arg)
+            return f"🔕 Watch `{arg}` removido."
+        except Exception as exc:
+            return f"❌ Erro: {exc}"
+
+    async def _handle_teams_list_command(self, event: "MessageEvent") -> str:
+        """Handle /teams_list — list active Teams watches (022 US1)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /teams_list."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        owner_id = str(source.user_id)
+        watches = self._session_db.list_teams_watches(owner_id=owner_id)
+        if not watches:
+            return "Nenhum canal/chat do Teams monitorado."
+        lines = ["📡 *Teams watches ativos:*\n"]
+        for w in watches:
+            mode = "🔔" if w.get("delivery_mode") == "realtime" else "⏱"
+            alias = f" *{w['alias']}*" if w.get("alias") else ""
+            lines.append(f"{mode} `{w['watch_id']}`{alias} — `{w['ms_resource_id']}`")
+        return "\n".join(lines)
+
+    # =========================================================================
+    # 022 Email sentinel command handlers
+    # =========================================================================
+
+    async def _handle_email_connect_command(self, event: "MessageEvent") -> str:
+        """Handle /email_connect <alias> <imap_host> <user> — connect mailbox (022 US2)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_connect."
+        args = event.get_command_args().strip().split()
+        if len(args) < 3:
+            return "Uso: `/email_connect <alias> <imap_host> <username>`"
+        alias, host, username = args[0], args[1], args[2]
+        cs = self._get_sentinel_credentials_store()
+        if cs is None:
+            return "⚠️ HERMES_MASTER_KEY não configurado."
+        return (
+            f"📧 Para conectar *{alias}*, envie a senha de aplicativo agora (DM segura):\n"
+            f"`{alias} {host} {username} <senha-de-app>`\n\n"
+            f"_Use uma senha de aplicativo — nunca a senha da conta._"
+        )
+
+    async def _handle_email_connect_with_password(
+        self, alias: str, host: str, username: str, password: str, owner_id: str
+    ) -> str:
+        """Internal helper called after the owner sends the password."""
+        cs = self._get_sentinel_credentials_store()
+        sentinel = getattr(self, "_email_sentinel", None)
+        if cs is None or sentinel is None:
+            return "⚠️ Email sentinel não disponível."
+        try:
+            await sentinel.connect_account(
+                alias=alias,
+                host=host,
+                username=username,
+                auth_method="app_password",
+                secret=password,
+                credentials_store=cs,
+                owner_id=owner_id,
+            )
+            return f"✅ Caixa *{alias}* ({username}) conectada com sucesso."
+        except Exception as exc:
+            return f"❌ Falha ao conectar: {exc}"
+
+    async def _handle_email_list_command(self, event: "MessageEvent") -> str:
+        """Handle /email_list — list connected mailboxes (022 US2)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_list."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        accounts = self._session_db.list_mail_accounts(owner_id=str(source.user_id))
+        if not accounts:
+            return "Nenhuma caixa de email conectada."
+        lines = ["📬 *Caixas de email:*\n"]
+        for a in accounts:
+            state_emoji = {"live": "🟢", "disconnected": "🔴", "disabled": "⛔", "backfilling": "🔄"}.get(
+                a.get("connection_state", ""), "❓"
+            )
+            lines.append(f"{state_emoji} *{a['alias']}* — `{a['username']}@{a['host']}`")
+        return "\n".join(lines)
+
+    async def _handle_email_disconnect_command(self, event: "MessageEvent") -> str:
+        """Handle /email_disconnect <alias> — remove a mailbox (022 US2)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_disconnect."
+        alias = event.get_command_args().strip()
+        if not alias:
+            return "Uso: `/email_disconnect <alias>`"
+        sentinel = getattr(self, "_email_sentinel", None)
+        if sentinel is None:
+            return "⚠️ Email sentinel não disponível."
+        removed = await sentinel.disconnect_account(alias, str(source.user_id))
+        if removed:
+            return f"✅ Caixa *{alias}* desconectada."
+        return f"❌ Caixa *{alias}* não encontrada."
+
+    async def _handle_email_watch_command(self, event: "MessageEvent") -> str:
+        """Handle /email_watch <alias> <folder> — start watching a folder (022 US2)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_watch."
+        args = event.get_command_args().strip().split()
+        if not args:
+            return "Uso: `/email_watch <alias> [folder]`"
+        alias = args[0]
+        folder = args[1] if len(args) > 1 else "INBOX"
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        acct = self._session_db.find_mail_account_by_alias(alias, str(source.user_id))
+        if not acct:
+            return f"Caixa *{alias}* não encontrada. Use /email_connect primeiro."
+        sentinel = getattr(self, "_email_sentinel", None)
+        if sentinel is None:
+            return "⚠️ Email sentinel não disponível."
+        await sentinel.watch_folder(acct["account_id"], folder)
+        return f"👁 Monitorando pasta `{folder}` de *{alias}*."
+
+    async def _handle_email_unwatch_command(self, event: "MessageEvent") -> str:
+        """Handle /email_unwatch <watch_id> — stop watching a folder (022 US2)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_unwatch."
+        watch_id = event.get_command_args().strip()
+        if not watch_id:
+            return "Uso: `/email_unwatch <watch_id>`"
+        sentinel = getattr(self, "_email_sentinel", None)
+        if sentinel is None:
+            return "⚠️ Email sentinel não disponível."
+        await sentinel.unwatch(watch_id)
+        return f"🔕 Watch `{watch_id}` removido."
+
+    async def _handle_email_backfill_command(self, event: "MessageEvent") -> str:
+        """Handle /email_backfill <alias> [--since YYYY-MM-DD] — start backfill job (022 US3)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_backfill."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        args = event.get_command_args().strip().split()
+        if not args:
+            return "Uso: `/email_backfill <alias> [--since YYYY-MM-DD]`"
+        alias = args[0]
+        since = None
+        if "--since" in args:
+            idx = args.index("--since")
+            if idx + 1 < len(args):
+                since = args[idx + 1]
+        acct = self._session_db.find_mail_account_by_alias(alias, str(source.user_id))
+        if not acct:
+            return f"Caixa *{alias}* não encontrada. Use /email_connect primeiro."
+        # Dedup: check for active job
+        scope_hash = f"{acct['account_id']}-{since or 'full'}"
+        existing = self._session_db.get_active_backfill_job(acct["account_id"], scope_hash)
+        if existing:
+            return (
+                f"⏳ Já existe um backfill em andamento para *{alias}* "
+                f"(job `{existing['job_id']}`, estado: {existing['state']})."
+            )
+        from uuid import uuid4
+        job_id = f"bf_{uuid4().hex[:12]}"
+        folders_json = '["INBOX"]'
+        self._session_db.create_backfill_job(
+            job_id=job_id,
+            account_id=acct["account_id"],
+            scope_hash=scope_hash,
+            folders_json=folders_json,
+            owner_id=str(source.user_id),
+        )
+        # Launch backfill runner as background task
+        task = asyncio.create_task(
+            self._run_backfill_job(job_id, acct, since),
+            name=f"backfill-{job_id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        since_note = f" desde {since}" if since else " (histórico completo)"
+        return f"🔄 Backfill iniciado para *{alias}*{since_note} — job `{job_id}`."
+
+    async def _run_backfill_job(self, job_id: str, acct: dict, since: Optional[str]) -> None:
+        """Background task that runs the email backfill job (022 US3 stub)."""
+        if self._session_db is None:
+            return
+        self._session_db.start_backfill_job(job_id, total_estimated=0)
+        try:
+            # Full backfill implementation is in Phase 5 (BackfillRunner).
+            # This stub marks the job as completed immediately.
+            logger.info("Backfill job %s started (stub — BackfillRunner not yet implemented)", job_id)
+            self._session_db.complete_backfill_job(job_id)
+        except Exception as exc:
+            logger.exception("Backfill job %s failed: %s", job_id, exc)
+            self._session_db.fail_backfill_job(job_id, str(exc))
+
+    async def _handle_email_backfill_status_command(self, event: "MessageEvent") -> str:
+        """Handle /email_backfill_status [alias] — show backfill progress (022 US3)."""
+        source = event.source
+        if source.user_id is None or self._contact_manager is None:
+            return "Comando disponível apenas em DMs."
+        if not self._contact_manager.is_owner(source.user_id):
+            return "Somente o administrador pode usar /email_backfill_status."
+        if self._session_db is None:
+            return "Armazenamento indisponível."
+        alias = event.get_command_args().strip()
+        owner_id = str(source.user_id)
+        if alias:
+            acct = self._session_db.find_mail_account_by_alias(alias, owner_id)
+            if not acct:
+                return f"Caixa *{alias}* não encontrada."
+            jobs = self._session_db.list_backfill_jobs_by_account(acct["account_id"])
+        else:
+            # All jobs for owner across all accounts
+            accounts = self._session_db.list_mail_accounts(owner_id=owner_id)
+            jobs = []
+            for a in accounts:
+                jobs.extend(self._session_db.list_backfill_jobs_by_account(a["account_id"]))
+        if not jobs:
+            return "Nenhum backfill registrado."
+        lines = ["📊 *Status dos backfills:*\n"]
+        state_emoji = {
+            "queued": "⏳", "running": "🔄", "paused": "⏸",
+            "completed": "✅", "failed": "❌",
+        }
+        for j in jobs[:10]:
+            emoji = state_emoji.get(j.get("state", ""), "❓")
+            pct = ""
+            if j.get("total_estimated") and j["total_estimated"] > 0:
+                pct = f" ({j.get('processed_count', 0)}/{j['total_estimated']})"
+            lines.append(f"{emoji} `{j['job_id']}`{pct} — {j.get('state', '?')}")
+        return "\n".join(lines)
+
     async def _maybe_intercept_document_extraction(
         self,
         *,
@@ -3930,6 +4367,30 @@ class GatewayRunner:
                 return await self._handle_scenarios_command(event)
             if event.get_command() == "test_history":
                 return await self._handle_test_history_command(event)
+            # 022 Teams sentinel commands
+            if event.get_command() == "teams_connect":
+                return await self._handle_teams_connect_command(event)
+            if event.get_command() == "teams_watch":
+                return await self._handle_teams_watch_command(event)
+            if event.get_command() == "teams_unwatch":
+                return await self._handle_teams_unwatch_command(event)
+            if event.get_command() == "teams_list":
+                return await self._handle_teams_list_command(event)
+            # 022 Email sentinel commands
+            if event.get_command() == "email_connect":
+                return await self._handle_email_connect_command(event)
+            if event.get_command() == "email_list":
+                return await self._handle_email_list_command(event)
+            if event.get_command() == "email_disconnect":
+                return await self._handle_email_disconnect_command(event)
+            if event.get_command() == "email_watch":
+                return await self._handle_email_watch_command(event)
+            if event.get_command() == "email_unwatch":
+                return await self._handle_email_unwatch_command(event)
+            if event.get_command() == "email_backfill":
+                return await self._handle_email_backfill_command(event)
+            if event.get_command() == "email_backfill_status":
+                return await self._handle_email_backfill_status_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -4131,6 +4592,30 @@ class GatewayRunner:
             return await self._handle_scenarios_command(event)
         if canonical == "test_history":
             return await self._handle_test_history_command(event)
+        # 022 Teams sentinel commands
+        if canonical == "teams_connect":
+            return await self._handle_teams_connect_command(event)
+        if canonical == "teams_watch":
+            return await self._handle_teams_watch_command(event)
+        if canonical == "teams_unwatch":
+            return await self._handle_teams_unwatch_command(event)
+        if canonical == "teams_list":
+            return await self._handle_teams_list_command(event)
+        # 022 Email sentinel commands
+        if canonical == "email_connect":
+            return await self._handle_email_connect_command(event)
+        if canonical == "email_list":
+            return await self._handle_email_list_command(event)
+        if canonical == "email_disconnect":
+            return await self._handle_email_disconnect_command(event)
+        if canonical == "email_watch":
+            return await self._handle_email_watch_command(event)
+        if canonical == "email_unwatch":
+            return await self._handle_email_unwatch_command(event)
+        if canonical == "email_backfill":
+            return await self._handle_email_backfill_command(event)
+        if canonical == "email_backfill_status":
+            return await self._handle_email_backfill_status_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
