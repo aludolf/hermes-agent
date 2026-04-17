@@ -275,12 +275,39 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
 
+    async def _handle_ms_graph_webhook(self, request: "web.Request") -> "web.Response":
+        """Handle POST /webhooks/ms-graph — MS Graph change notifications."""
+        from agent.orchestrator.teams_webhook import handle_ms_graph_webhook
+
+        body = await request.read()
+        query_params = dict(request.rel_url.query)
+        runner = self.gateway_runner
+        session_db = getattr(runner, "_session_db", None)
+        teams_sentinel = getattr(runner, "_teams_sentinel", None)
+
+        try:
+            status, body_out, content_type = await handle_ms_graph_webhook(
+                body, query_params, session_db=session_db, teams_sentinel=teams_sentinel
+            )
+        except Exception as exc:
+            logger.exception("[ms-graph] Unhandled error: %s", exc)
+            return web.Response(status=500, body=b"Internal error", content_type="text/plain")
+
+        return web.Response(status=status, body=body_out, content_type=content_type)
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
         self._reload_dynamic_routes()
 
         route_name = request.match_info.get("route_name", "")
+
+        # MS Graph change notifications have their own validation protocol
+        # (validationToken echo + clientState integrity) and bypass the
+        # generic HMAC/prompt pipeline entirely.
+        if route_name == "ms-graph":
+            return await self._handle_ms_graph_webhook(request)
+
         route_config = self._routes.get(route_name)
 
         if not route_config:

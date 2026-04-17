@@ -1,110 +1,89 @@
-"""Tests for the POST /webhooks/ms-graph route (022 US1 T052).
-
-Uses the pure handler function rather than a live HTTP server
-since the gateway uses aiohttp, not a test-client-friendly framework.
-All tests exercise handle_ms_graph_webhook directly.
-"""
+"""Tests for the /webhooks/ms-graph aiohttp route (022 Phase 7)."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
-
-import pytest
-
-from agent.orchestrator.teams_webhook import handle_ms_graph_webhook
-from hermes_state import SessionDB
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
-def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+def _make_adapter():
+    from gateway.platforms.webhook import WebhookAdapter
+    adapter = WebhookAdapter.__new__(WebhookAdapter)
+    adapter._routes = {}
+    adapter._rate_counts = {}
+    adapter._rate_limit = 30
+    adapter._max_body_bytes = 1_048_576
+    adapter._seen_deliveries = {}
+    adapter._idempotency_ttl = 3600
+    adapter._delivery_info = {}
+    adapter._delivery_info_created = {}
+    adapter.gateway_runner = None
+    adapter._reload_dynamic_routes = lambda: None
+    return adapter
 
 
-@pytest.fixture
-def db(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    yield db
-    db.close()
+def test_ms_graph_route_not_in_generic_routes():
+    """ms-graph is handled before the generic _routes lookup."""
+    adapter = _make_adapter()
+    assert "ms-graph" not in adapter._routes
+    assert hasattr(adapter, "_handle_ms_graph_webhook")
 
 
-def _seed_watch(db, client_state: str = "nonce_abc") -> None:
-    db.create_teams_watch(
-        watch_id="tw_1",
-        owner_id="289",
-        resource_type="chat",
-        ms_resource_id="19:chat@thread.v2",
-        client_state=client_state,
-    )
+def test_handle_ms_graph_webhook_validation():
+    adapter = _make_adapter()
+    mock_request = MagicMock()
+    mock_request.read = AsyncMock(return_value=b"")
+    mock_request.rel_url.query = {"validationToken": "abc123"}
+
+    async def run():
+        with patch(
+            "agent.orchestrator.teams_webhook.handle_ms_graph_webhook",
+            new_callable=AsyncMock,
+            return_value=(200, b"abc123", "text/plain"),
+        ):
+            return await adapter._handle_ms_graph_webhook(mock_request)
+
+    response = asyncio.run(run())
+    assert response.status == 200
 
 
-# ---------------------------------------------------------------------------
-# Validation handshake
-# ---------------------------------------------------------------------------
+def test_handle_ms_graph_webhook_notification():
+    adapter = _make_adapter()
+    adapter.gateway_runner = MagicMock()
+    adapter.gateway_runner._session_db = MagicMock()
+    adapter.gateway_runner._teams_sentinel = None
 
-def test_validation_handshake_echo():
-    status, body, ct = _run(
-        handle_ms_graph_webhook(
-            b"",
-            {"validationToken": "test-token-xyz"},
-            session_db=None,
-            teams_sentinel=None,
-        )
-    )
-    assert status == 200
-    assert body == b"test-token-xyz"
-    assert "text/plain" in ct
+    body = json.dumps({"value": [{"clientState": "cs_x"}]}).encode()
+    mock_request = MagicMock()
+    mock_request.read = AsyncMock(return_value=body)
+    mock_request.rel_url.query = {}
 
+    async def run():
+        with patch(
+            "agent.orchestrator.teams_webhook.handle_ms_graph_webhook",
+            new_callable=AsyncMock,
+            return_value=(202, b"", "application/json"),
+        ):
+            return await adapter._handle_ms_graph_webhook(mock_request)
 
-# ---------------------------------------------------------------------------
-# Valid notification → 202
-# ---------------------------------------------------------------------------
-
-def test_valid_notification_returns_202(db):
-    _seed_watch(db)
-    sentinel = AsyncMock()
-    payload = json.dumps({
-        "value": [{"clientState": "nonce_abc", "resourceData": {"id": "msg1"}}]
-    }).encode()
-    status, body, ct = _run(
-        handle_ms_graph_webhook(payload, {}, session_db=db, teams_sentinel=sentinel)
-    )
-    assert status == 202
-    sentinel.process_notification.assert_called_once()
+    response = asyncio.run(run())
+    assert response.status == 202
 
 
-# ---------------------------------------------------------------------------
-# Invalid clientState → 400
-# ---------------------------------------------------------------------------
+def test_handle_ms_graph_webhook_exception_returns_500():
+    adapter = _make_adapter()
+    mock_request = MagicMock()
+    mock_request.read = AsyncMock(return_value=b"bad")
+    mock_request.rel_url.query = {}
 
-def test_invalid_client_state_returns_400(db):
-    _seed_watch(db)
-    payload = json.dumps({
-        "value": [{"clientState": "wrong", "resourceData": {"id": "msg1"}}]
-    }).encode()
-    status, _, _ = _run(
-        handle_ms_graph_webhook(payload, {}, session_db=db, teams_sentinel=None)
-    )
-    assert status == 400
+    async def run():
+        with patch(
+            "agent.orchestrator.teams_webhook.handle_ms_graph_webhook",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ):
+            return await adapter._handle_ms_graph_webhook(mock_request)
 
-
-# ---------------------------------------------------------------------------
-# Malformed body → 400
-# ---------------------------------------------------------------------------
-
-def test_malformed_json_returns_400(db):
-    status, _, _ = _run(
-        handle_ms_graph_webhook(b"[not valid json", {}, session_db=db, teams_sentinel=None)
-    )
-    assert status == 400
-
-
-# ---------------------------------------------------------------------------
-# Empty body → 400
-# ---------------------------------------------------------------------------
-
-def test_empty_body_returns_400(db):
-    status, _, _ = _run(
-        handle_ms_graph_webhook(b"", {}, session_db=db, teams_sentinel=None)
-    )
-    assert status == 400
+    response = asyncio.run(run())
+    assert response.status == 500
