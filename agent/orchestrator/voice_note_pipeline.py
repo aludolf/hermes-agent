@@ -176,6 +176,8 @@ async def perform_extraction(
     chat_id: str | None = None,
     current_date: date | None = None,
     force_preview: bool = False,
+    suppress_action_routing: bool = False,
+    execution_mode_override: str | None = None,
     extract_fn: Callable[..., ExtractionResult | None] | None = None,
 ) -> PipelineOutcome | None:
     """Run the full extraction → route → persist pipeline.
@@ -232,21 +234,39 @@ async def perform_extraction(
     if not long_input and all(a.confidence < CLARIFY_CONFIDENCE for a in result.actions):
         return None
 
-    handlers = RoutedHandlers(
-        list_manager=list_manager,
-        calendar_bridge=calendar_bridge,
-        reminder_service=reminder_service,
-    )
+    # 022: backfill / sentinel-audit mode — build a router with no handlers
+    # so every action returns status='pending' (same effect as long_input)
+    # without ever touching list_manager / calendar_bridge / reminder_service.
+    # Belt-and-suspenders: we ALSO pass long_input=True below so the
+    # capability/confidence branches are bypassed for every action.
+    if suppress_action_routing:
+        handlers = RoutedHandlers()
+        effective_long_input = True
+    else:
+        handlers = RoutedHandlers(
+            list_manager=list_manager,
+            calendar_bridge=calendar_bridge,
+            reminder_service=reminder_service,
+        )
+        effective_long_input = long_input
+
     routed = route_actions(
         result,
         sender_id=sender_id,
         sender_capabilities=sender_capabilities,
         sender_name=sender_name,
         handlers=handlers,
-        long_input=long_input,
+        long_input=effective_long_input,
     )
 
-    execution_mode = "preview" if long_input else "auto"
+    if execution_mode_override is not None:
+        execution_mode = execution_mode_override
+    elif suppress_action_routing:
+        execution_mode = "skipped"
+    elif long_input:
+        execution_mode = "preview"
+    else:
+        execution_mode = "auto"
     extraction_id = new_extraction_id()
     transcript_preview = transcript[:500]
 
@@ -289,6 +309,18 @@ async def perform_extraction(
             )
         except Exception as e:
             logger.warning("pipeline: persist failed: %s", e)
+
+    # 022: backfill path — no preview, no reply_text. The runner polls
+    # progress separately. Just return the outcome so callers can record
+    # per-batch bookkeeping.
+    if suppress_action_routing:
+        return PipelineOutcome(
+            reply_text="",
+            extraction_id=extraction_id,
+            execution_mode=execution_mode,
+            result=result,
+            routed=routed,
+        )
 
     if long_input:
         preview_id = new_preview_id()

@@ -204,6 +204,10 @@ class SourceKind(StrEnum):
     VOICE_NOTE = "voice_note"
     DOCUMENT_UPLOAD = "document_upload"
     PASTED_TEXT = "pasted_text"
+    # 022 Teams & Email sentinels
+    TEAMS_MESSAGE = "teams_message"
+    EMAIL = "email"
+    EMAIL_BACKFILL = "email_backfill"
 
 
 class ExecutionMode(StrEnum):
@@ -267,6 +271,62 @@ class TriggerSource(StrEnum):
     SLASH_COMMAND = "slash_command"
     NATURAL_LANGUAGE = "natural_language"
     CRON = "cron"
+
+
+# ---------------------------------------------------------------------------
+# 022: Teams & Email Sentinels enums
+# ---------------------------------------------------------------------------
+
+class DeliveryMode(StrEnum):
+    """How a Teams watch receives new messages."""
+    REALTIME = "realtime"
+    POLLING = "polling"
+
+
+class MailConnectionState(StrEnum):
+    """Lifecycle of a connected mailbox."""
+    LIVE = "live"
+    DISCONNECTED = "disconnected"
+    DISABLED = "disabled"
+    BACKFILLING = "backfilling"
+
+
+class MailAuthMethod(StrEnum):
+    """How we authenticate to an IMAP server."""
+    XOAUTH2 = "xoauth2"
+    APP_PASSWORD = "app_password"
+
+
+class IdleState(StrEnum):
+    """Per-folder IMAP IDLE watcher state machine."""
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    AUTHENTICATING = "authenticating"
+    IDLING = "idling"
+    RECONNECTING_BACKOFF = "reconnecting_backoff"
+    DISABLED = "disabled"
+
+
+class BackfillState(StrEnum):
+    """Lifecycle of a mailbox backfill job."""
+    QUEUED = "queued"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class CredentialKind(StrEnum):
+    """Kind of secret stored in the credentials_store table."""
+    MS_GRAPH_REFRESH_TOKEN = "ms_graph_refresh_token"
+    IMAP_APP_PASSWORD = "imap_app_password"
+    IMAP_XOAUTH2_REFRESH_TOKEN = "imap_xoauth2_refresh_token"
+
+
+class TeamsResourceType(StrEnum):
+    """Kind of Teams resource being watched."""
+    CHAT = "chat"
+    CHANNEL = "channel"
 
 
 @dataclass(frozen=True)

@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -456,6 +456,104 @@ CREATE TABLE IF NOT EXISTS transcript_extraction_links (
 
 CREATE INDEX IF NOT EXISTS idx_links_extraction ON transcript_extraction_links(extraction_id);
 CREATE INDEX IF NOT EXISTS idx_links_job ON transcript_extraction_links(job_id);
+
+-- =====================================================================
+-- Teams & Email Sentinels tables (022)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS credentials_store (
+    credential_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    ciphertext BLOB NOT NULL,
+    label TEXT,
+    created_at REAL NOT NULL,
+    rotated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credentials_kind ON credentials_store(kind);
+
+CREATE TABLE IF NOT EXISTS teams_watches (
+    watch_id TEXT PRIMARY KEY,
+    alias TEXT,
+    resource_type TEXT NOT NULL,
+    ms_resource_id TEXT NOT NULL,
+    subscription_id TEXT,
+    subscription_expires_at REAL,
+    client_state TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'realtime',
+    polling_cursor TEXT,
+    mute_until REAL,
+    quiet_hours_start INTEGER,
+    quiet_hours_end INTEGER,
+    last_event_at REAL,
+    owner_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL,
+    UNIQUE(owner_id, ms_resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_teams_watches_owner ON teams_watches(owner_id);
+CREATE INDEX IF NOT EXISTS idx_teams_watches_expires ON teams_watches(subscription_expires_at);
+CREATE INDEX IF NOT EXISTS idx_teams_watches_alias ON teams_watches(owner_id, alias);
+
+CREATE TABLE IF NOT EXISTS mail_accounts (
+    account_id TEXT PRIMARY KEY,
+    alias TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL DEFAULT 993,
+    username TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    credential_ref TEXT NOT NULL REFERENCES credentials_store(credential_id),
+    connection_state TEXT NOT NULL DEFAULT 'disconnected',
+    last_error TEXT,
+    last_successful_sync_at REAL,
+    owner_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL,
+    UNIQUE(owner_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_accounts_owner ON mail_accounts(owner_id);
+CREATE INDEX IF NOT EXISTS idx_mail_accounts_state ON mail_accounts(connection_state);
+
+CREATE TABLE IF NOT EXISTS mail_watches (
+    watch_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES mail_accounts(account_id),
+    folder TEXT NOT NULL,
+    last_seen_uid INTEGER,
+    uidvalidity INTEGER,
+    idle_state TEXT NOT NULL DEFAULT 'disconnected',
+    last_activity_at REAL,
+    reconnect_attempts INTEGER DEFAULT 0,
+    created_at REAL NOT NULL,
+    UNIQUE(account_id, folder)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_watches_account ON mail_watches(account_id);
+CREATE INDEX IF NOT EXISTS idx_mail_watches_state ON mail_watches(idle_state);
+
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    job_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES mail_accounts(account_id),
+    scope_hash TEXT NOT NULL,
+    folders_json TEXT NOT NULL,
+    since_ts REAL,
+    until_ts REAL,
+    total_estimated INTEGER,
+    processed_count INTEGER DEFAULT 0,
+    failed_count INTEGER DEFAULT 0,
+    rate_limit_msgs_per_min INTEGER DEFAULT 60,
+    state TEXT NOT NULL DEFAULT 'queued',
+    resumption_cursor_json TEXT,
+    error_message TEXT,
+    started_at REAL,
+    finished_at REAL,
+    owner_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_account ON backfill_jobs(account_id);
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_state ON backfill_jobs(state);
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_scope ON backfill_jobs(account_id, scope_hash);
 """
 
 
@@ -689,6 +787,11 @@ class SessionDB:
                 # entity context, harness scenarios + runs, transcript-extraction lineage
                 cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
                 cursor.execute("UPDATE schema_version SET version = 9")
+            if current_version < 10:
+                # v10: teams + email sentinels (022) — credentials_store, teams_watches,
+                # mail_accounts, mail_watches, backfill_jobs
+                cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
+                cursor.execute("UPDATE schema_version SET version = 10")
 
         # Ensure orchestrator tables exist for fresh databases too
         cursor.executescript(_ORCHESTRATOR_SCHEMA_SQL)
@@ -2736,3 +2839,420 @@ class SessionDB:
                 (extraction_id,),
             ).fetchall()
             return [row["job_id"] for row in rows]
+
+    # =========================================================================
+    # 022 Sentinels: credentials_store (Fernet ciphertext blobs)
+    # =========================================================================
+
+    def put_credential_ciphertext(self, *, credential_id, kind, ciphertext, label=None):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO credentials_store
+                   (credential_id, kind, ciphertext, label, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (credential_id, str(kind), ciphertext, label, time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_credential_ciphertext(self, credential_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM credentials_store WHERE credential_id = ?",
+                (credential_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def rotate_credential(self, credential_id, new_ciphertext):
+        def _do(conn):
+            conn.execute(
+                "UPDATE credentials_store SET ciphertext = ?, rotated_at = ? "
+                "WHERE credential_id = ?",
+                (new_ciphertext, time.time(), credential_id),
+            )
+        self._execute_write(_do)
+
+    def delete_credential(self, credential_id):
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM credentials_store WHERE credential_id = ?",
+                (credential_id,),
+            )
+        self._execute_write(_do)
+
+    def list_credentials_by_kind(self, kind=None):
+        """Metadata-only listing. NEVER returns ciphertext — only id/kind/label/timestamps."""
+        clauses, params = [], []
+        if kind:
+            clauses.append("kind = ?"); params.append(str(kind))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT credential_id, kind, label, created_at, rotated_at "
+                f"FROM credentials_store{where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # =========================================================================
+    # 022 Sentinels: teams_watches
+    # =========================================================================
+
+    def create_teams_watch(
+        self, *, watch_id, owner_id, resource_type, ms_resource_id,
+        alias=None, client_state=None, delivery_mode="realtime",
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO teams_watches
+                   (watch_id, alias, resource_type, ms_resource_id,
+                    client_state, delivery_mode, owner_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (watch_id, alias, str(resource_type), ms_resource_id,
+                 client_state, str(delivery_mode), str(owner_id), time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_teams_watch(self, watch_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM teams_watches WHERE watch_id = ?", (watch_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def find_teams_watch_by_resource(self, owner_id, ms_resource_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM teams_watches "
+                "WHERE owner_id = ? AND ms_resource_id = ?",
+                (str(owner_id), ms_resource_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_teams_watches(self, owner_id=None):
+        clauses, params = [], []
+        if owner_id:
+            clauses.append("owner_id = ?"); params.append(str(owner_id))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM teams_watches{where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_teams_watch_subscription(
+        self, watch_id, *, subscription_id, expires_at,
+    ):
+        def _do(conn):
+            conn.execute(
+                """UPDATE teams_watches
+                   SET subscription_id = ?, subscription_expires_at = ?,
+                       delivery_mode = 'realtime', updated_at = ?
+                   WHERE watch_id = ?""",
+                (subscription_id, expires_at, time.time(), watch_id),
+            )
+        self._execute_write(_do)
+
+    def update_teams_watch_mode(self, watch_id, delivery_mode, polling_cursor=None):
+        def _do(conn):
+            conn.execute(
+                """UPDATE teams_watches
+                   SET delivery_mode = ?, polling_cursor = COALESCE(?, polling_cursor),
+                       updated_at = ?
+                   WHERE watch_id = ?""",
+                (str(delivery_mode), polling_cursor, time.time(), watch_id),
+            )
+        self._execute_write(_do)
+
+    def set_teams_watch_mute(
+        self, watch_id, *, mute_until=None,
+        quiet_hours_start=None, quiet_hours_end=None,
+    ):
+        def _do(conn):
+            conn.execute(
+                """UPDATE teams_watches
+                   SET mute_until = ?, quiet_hours_start = ?,
+                       quiet_hours_end = ?, updated_at = ?
+                   WHERE watch_id = ?""",
+                (mute_until, quiet_hours_start, quiet_hours_end,
+                 time.time(), watch_id),
+            )
+        self._execute_write(_do)
+
+    def touch_teams_watch_event(self, watch_id):
+        def _do(conn):
+            conn.execute(
+                "UPDATE teams_watches SET last_event_at = ? WHERE watch_id = ?",
+                (time.time(), watch_id),
+            )
+        self._execute_write(_do)
+
+    def delete_teams_watch(self, watch_id):
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM teams_watches WHERE watch_id = ?", (watch_id,),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # 022 Sentinels: mail_accounts
+    # =========================================================================
+
+    def create_mail_account(
+        self, *, account_id, alias, host, username, auth_method,
+        credential_ref, owner_id, port=993, connection_state="disconnected",
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO mail_accounts
+                   (account_id, alias, host, port, username, auth_method,
+                    credential_ref, connection_state, owner_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (account_id, alias, host, port, username, str(auth_method),
+                 credential_ref, str(connection_state), str(owner_id),
+                 time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_mail_account(self, account_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mail_accounts WHERE account_id = ?", (account_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def find_mail_account_by_alias(self, owner_id, alias):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mail_accounts WHERE owner_id = ? AND alias = ?",
+                (str(owner_id), alias),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_mail_accounts(self, owner_id=None):
+        clauses, params = [], []
+        if owner_id:
+            clauses.append("owner_id = ?"); params.append(str(owner_id))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM mail_accounts{where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_mail_account_state(
+        self, account_id, state, *, last_error=None,
+    ):
+        def _do(conn):
+            now = time.time()
+            if str(state) == "live":
+                conn.execute(
+                    """UPDATE mail_accounts
+                       SET connection_state = ?, last_error = NULL,
+                           last_successful_sync_at = ?, updated_at = ?
+                       WHERE account_id = ?""",
+                    (str(state), now, now, account_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE mail_accounts
+                       SET connection_state = ?, last_error = ?, updated_at = ?
+                       WHERE account_id = ?""",
+                    (str(state), last_error, now, account_id),
+                )
+        self._execute_write(_do)
+
+    def delete_mail_account(self, account_id):
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM mail_watches WHERE account_id = ?", (account_id,),
+            )
+            conn.execute(
+                "DELETE FROM mail_accounts WHERE account_id = ?", (account_id,),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # 022 Sentinels: mail_watches
+    # =========================================================================
+
+    def create_mail_watch(self, *, watch_id, account_id, folder):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO mail_watches
+                   (watch_id, account_id, folder, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (watch_id, account_id, folder, time.time()),
+            )
+        self._execute_write(_do)
+
+    def list_mail_watches_by_account(self, account_id):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM mail_watches WHERE account_id = ? "
+                "ORDER BY created_at ASC",
+                (account_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_all_mail_watches(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM mail_watches ORDER BY created_at ASC",
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_mail_watch_cursor(
+        self, watch_id, *, last_seen_uid, uidvalidity,
+    ):
+        def _do(conn):
+            conn.execute(
+                """UPDATE mail_watches
+                   SET last_seen_uid = ?, uidvalidity = ?,
+                       last_activity_at = ?, reconnect_attempts = 0
+                   WHERE watch_id = ?""",
+                (last_seen_uid, uidvalidity, time.time(), watch_id),
+            )
+        self._execute_write(_do)
+
+    def update_mail_watch_state(
+        self, watch_id, idle_state, *, increment_reconnect=False,
+    ):
+        def _do(conn):
+            if increment_reconnect:
+                conn.execute(
+                    """UPDATE mail_watches
+                       SET idle_state = ?, last_activity_at = ?,
+                           reconnect_attempts = reconnect_attempts + 1
+                       WHERE watch_id = ?""",
+                    (str(idle_state), time.time(), watch_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE mail_watches
+                       SET idle_state = ?, last_activity_at = ?
+                       WHERE watch_id = ?""",
+                    (str(idle_state), time.time(), watch_id),
+                )
+        self._execute_write(_do)
+
+    def delete_mail_watch(self, watch_id):
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM mail_watches WHERE watch_id = ?", (watch_id,),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # 022 Sentinels: backfill_jobs
+    # =========================================================================
+
+    def create_backfill_job(
+        self, *, job_id, account_id, scope_hash, folders_json, owner_id,
+        since_ts=None, until_ts=None, rate_limit_msgs_per_min=60,
+    ):
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO backfill_jobs
+                   (job_id, account_id, scope_hash, folders_json, since_ts,
+                    until_ts, rate_limit_msgs_per_min, state, owner_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+                (job_id, account_id, scope_hash, folders_json, since_ts,
+                 until_ts, rate_limit_msgs_per_min, str(owner_id)),
+            )
+        self._execute_write(_do)
+
+    def get_backfill_job(self, job_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM backfill_jobs WHERE job_id = ?", (job_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_active_backfill_job(self, account_id, scope_hash):
+        """Return the running or queued job for this (account, scope) pair."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM backfill_jobs
+                   WHERE account_id = ? AND scope_hash = ?
+                     AND state IN ('queued', 'running', 'paused')
+                   ORDER BY COALESCE(started_at, 0) DESC LIMIT 1""",
+                (account_id, scope_hash),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_backfill_jobs_by_account(self, account_id, *, limit=20):
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM backfill_jobs WHERE account_id = ?
+                   ORDER BY COALESCE(started_at, 0) DESC LIMIT ?""",
+                (account_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def start_backfill_job(self, job_id, *, total_estimated):
+        def _do(conn):
+            conn.execute(
+                """UPDATE backfill_jobs
+                   SET state = 'running', started_at = ?, total_estimated = ?
+                   WHERE job_id = ?""",
+                (time.time(), total_estimated, job_id),
+            )
+        self._execute_write(_do)
+
+    def update_backfill_progress(
+        self, job_id, *, processed_count, failed_count,
+    ):
+        def _do(conn):
+            conn.execute(
+                """UPDATE backfill_jobs
+                   SET processed_count = ?, failed_count = ?
+                   WHERE job_id = ?""",
+                (processed_count, failed_count, job_id),
+            )
+        self._execute_write(_do)
+
+    def update_backfill_cursor(self, job_id, resumption_cursor_json):
+        def _do(conn):
+            conn.execute(
+                "UPDATE backfill_jobs SET resumption_cursor_json = ? "
+                "WHERE job_id = ?",
+                (resumption_cursor_json, job_id),
+            )
+        self._execute_write(_do)
+
+    def pause_backfill_job(self, job_id):
+        def _do(conn):
+            conn.execute(
+                "UPDATE backfill_jobs SET state = 'paused' WHERE job_id = ?",
+                (job_id,),
+            )
+        self._execute_write(_do)
+
+    def complete_backfill_job(self, job_id):
+        def _do(conn):
+            conn.execute(
+                """UPDATE backfill_jobs
+                   SET state = 'completed', finished_at = ? WHERE job_id = ?""",
+                (time.time(), job_id),
+            )
+        self._execute_write(_do)
+
+    def fail_backfill_job(self, job_id, error_message):
+        def _do(conn):
+            conn.execute(
+                """UPDATE backfill_jobs
+                   SET state = 'failed', error_message = ?, finished_at = ?
+                   WHERE job_id = ?""",
+                (error_message, time.time(), job_id),
+            )
+        self._execute_write(_do)
+
+    def list_resumable_backfill_jobs(self):
+        """Jobs in running or paused state — used at gateway startup to resume."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM backfill_jobs WHERE state IN ('running', 'paused')",
+            ).fetchall()
+            return [dict(row) for row in rows]

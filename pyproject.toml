@@ -77,6 +77,14 @@ termux = [
 dingtalk = ["dingtalk-stream>=0.1.0,<1"]
 feishu = ["lark-oapi>=1.5.3,<2"]
 web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]
+sentinels = [
+  # 022 Teams & Email sentinels. msal for Microsoft OAuth device-code flow,
+  # aioimaplib for asyncio IMAP IDLE, cryptography (Fernet) for encrypted
+  # credentials at rest. httpx is already in the base install.
+  "msal>=1.31,<2",
+  "aioimaplib>=1.0,<2",
+  "cryptography>=41",
+]
 rl = [
   "atroposlib @ git+https://github.com/NousResearch/atropos.git@c20c85256e5a45ad31edf8b7276e9c5ee1995a30",
   "tinker @ git+https://github.com/thinking-machines-lab/tinker.git@30517b667f18a3dfb7ef33fb56cf686d5820ba2b",
@@ -109,6 +117,7 @@ all = [
   "hermes-agent[feishu]",
   "hermes-agent[mistral]",
   "hermes-agent[web]",
+  "hermes-agent[sentinels]",
 ]
 
 [project.scripts]

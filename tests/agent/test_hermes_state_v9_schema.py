@@ -38,8 +38,11 @@ def test_fresh_db_initializes_at_v9(tmp_path):
             "SELECT version FROM schema_version"
         ).fetchone()
         assert row is not None
-        assert row["version"] == 9
-        assert hermes_state.SCHEMA_VERSION == 9
+        # SCHEMA_VERSION advances as new features ship; v9 tests only care
+        # that the v9 migration has run (i.e. the intelligence-layer tables
+        # exist). Assert >= 9 so later bumps don't break these tests.
+        assert row["version"] >= 9
+        assert hermes_state.SCHEMA_VERSION >= 9
     finally:
         db.close()
 
@@ -76,7 +79,7 @@ def test_v8_database_upgrades_to_v9(tmp_path):
         row = db2._conn.execute(
             "SELECT version FROM schema_version"
         ).fetchone()
-        assert row["version"] == 9
+        assert row["version"] >= 9
 
         tables = _list_tables(db2._conn)
         for table in INTELLIGENCE_LAYER_TABLES:
