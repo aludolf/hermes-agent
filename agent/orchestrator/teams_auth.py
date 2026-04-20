@@ -15,12 +15,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-MS_GRAPH_AUTHORITY = "https://login.microsoftonline.com/consumers"
+def _ms_graph_authority() -> str:
+    tenant = os.getenv("MS_GRAPH_TENANT_ID", "").strip()
+    if tenant:
+        return f"https://login.microsoftonline.com/{tenant}"
+    return "https://login.microsoftonline.com/common"
+
+MS_GRAPH_AUTHORITY = _ms_graph_authority()
 MS_GRAPH_SCOPES = [
     "Chat.Read",
     "ChannelMessage.Read.All",
     "User.Read",
-    "offline_access",
+    # offline_access is reserved by MSAL and added automatically
 ]
 
 _CRED_KIND_REFRESH = "ms_graph_refresh_token"

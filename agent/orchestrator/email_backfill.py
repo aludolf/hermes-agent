@@ -1,9 +1,8 @@
 """Async mailbox backfill runner (022 US3).
 
 Token-bucket rate limiter + resumable per-folder UID cursor.
-Backfilled items flow into the extraction queue with
-suppress_action_routing=True and execution_mode_override='skipped'
-so they populate KB/entity-context only, never fire calendar events.
+Backfilled emails are written DIRECTLY to extraction_events (execution_mode='skipped')
+and sender email addresses are upserted into entity_context — zero LLM calls.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import logging
 import re
 import time
 from typing import Any, Callable, Coroutine, Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +49,13 @@ class TokenBucketRateLimiter:
 class BackfillRunner:
     """Runs one backfill_job to completion (or until cancelled).
 
+    Writes directly to extraction_events (execution_mode='skipped') and
+    entity_context — no LLM calls, no extraction queue.
+
     Parameters
     ----------
     session_db:
         Open SessionDB instance.
-    extraction_queue:
-        SentinelExtractionQueue — must implement ``enqueue(item)`` coroutine.
     credentials_store:
         CredentialsStore for loading the IMAP credential secret.
     notify_fn:
@@ -65,12 +66,12 @@ class BackfillRunner:
         self,
         *,
         session_db,
-        extraction_queue,
         credentials_store,
         notify_fn: Optional[Callable[[str], Coroutine]] = None,
+        # kept for backward compat — ignored
+        extraction_queue=None,
     ) -> None:
         self._db = session_db
-        self._queue = extraction_queue
         self._store = credentials_store
         self._notify = notify_fn
 
@@ -170,23 +171,29 @@ class BackfillRunner:
                             body = _parse_email_body(raw)
                             if not body:
                                 continue
-                            from agent.orchestrator.sentinel_queue import ExtractionItem
-                            item = ExtractionItem(
-                                transcript=body,
-                                sender_id=acct.get("owner_id", "owner"),
-                                sender_role="owner",
+                            h = hashlib.sha256(body.encode()).hexdigest()
+                            # Skip exact duplicates already in the DB
+                            if self._db.get_extraction_by_hash(h):
+                                continue
+                            sender_addr, subject = _parse_email_headers(raw)
+                            preview = f"[{subject}] {body[:120]}".strip()
+                            eid = f"ebf_{uuid4().hex[:16]}"
+                            self._db.create_extraction_event(
+                                extraction_id=eid,
                                 source_type="email",
                                 source_format="email-backfill",
-                                chat_id=job_id,
-                                suppress_action_routing=True,
-                                execution_mode_override="skipped",
-                                extra_kwargs={
-                                    "transcript_hash": hashlib.sha256(body.encode()).hexdigest(),
-                                    "backfill_job_id": job_id,
-                                    "folder": folder,
-                                },
+                                source_job_id=job_id,
+                                transcript_hash=h,
+                                transcript_preview=preview[:500],
+                                sender_id=acct.get("owner_id", "owner"),
+                                sender_role="owner",
+                                execution_mode="skipped",
+                                actions_json="[]",
+                                actions_count=0,
                             )
-                            await self._queue.enqueue(item)
+                            # Upsert sender into entity_context
+                            if sender_addr:
+                                _upsert_sender_entity(self._db, sender_addr, preview)
                         processed += 1
                     except asyncio.CancelledError:
                         raise
@@ -255,10 +262,7 @@ class BackfillRunner:
 
     async def _load_secret(self, acct: dict) -> str:
         cred_ref = acct.get("credential_ref", "")
-        row = self._db.get_credential_ciphertext(cred_ref)
-        if not row:
-            raise RuntimeError(f"Credential {cred_ref!r} not found")
-        return bytes(row["ciphertext"]).decode("utf-8")
+        return self._store.get(cred_ref)
 
     async def _notify_progress(self, msg: str) -> None:
         if self._notify:
@@ -297,6 +301,46 @@ def _parse_fetch_response(lines) -> list[tuple[int, bytes]]:
         else:
             i += 1
     return results
+
+
+def _parse_email_headers(raw: bytes) -> tuple[str, str]:
+    """Return (sender_email_addr, subject) from a raw RFC 5322 message."""
+    try:
+        msg = email_lib.message_from_bytes(raw, policy=email_lib.policy.default)
+        from_hdr = str(msg.get("From", "") or "")
+        subject = str(msg.get("Subject", "") or "").strip()
+        m = re.search(r"[\w.+\-]+@[\w.\-]+", from_hdr)
+        sender = m.group(0) if m else from_hdr.strip()
+        return sender, subject
+    except Exception:
+        return "", ""
+
+
+def _upsert_sender_entity(db, sender_addr: str, snippet: str) -> None:
+    """Create or bump an entity_context row for *sender_addr*."""
+    try:
+        from uuid import uuid4 as _uuid4
+        existing = db.get_entity_by_name(sender_addr)
+        if existing:
+            existing_snippets = json.loads(existing.get("context_snippets_json") or "[]")
+            existing_snippets = existing_snippets[-9:] + [snippet[:200]]
+            db.append_entity_context_snippet(
+                existing["entity_id"], json.dumps(existing_snippets)
+            )
+            db.upsert_entity(
+                entity_id=existing["entity_id"],
+                name=sender_addr,
+                entity_type="contact",
+            )
+        else:
+            db.upsert_entity(
+                entity_id=f"ec_{_uuid4().hex[:12]}",
+                name=sender_addr,
+                entity_type="contact",
+                context_snippets_json=json.dumps([snippet[:200]]),
+            )
+    except Exception as exc:
+        logger.debug("_upsert_sender_entity failed for %s: %s", sender_addr, exc)
 
 
 def _parse_email_body(raw: bytes) -> str:

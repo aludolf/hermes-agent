@@ -2133,6 +2133,7 @@ class GatewayRunner:
                 session_db=self._session_db,
                 extraction_queue=self._sentinel_queue,
                 owner_id=owner_id,
+                credentials_store=cs,
             )
             await self._email_sentinel.start()
             logger.info("EmailSentinel started")
@@ -3473,7 +3474,7 @@ class GatewayRunner:
         folder = args[1] if len(args) > 1 else "INBOX"
         if self._session_db is None:
             return "Armazenamento indisponível."
-        acct = self._session_db.find_mail_account_by_alias(alias, str(source.user_id))
+        acct = self._session_db.find_mail_account_by_alias(str(source.user_id), alias)
         if not acct:
             return f"Caixa *{alias}* não encontrada. Use /email_connect primeiro."
         sentinel = getattr(self, "_email_sentinel", None)
@@ -3516,7 +3517,7 @@ class GatewayRunner:
             idx = args.index("--since")
             if idx + 1 < len(args):
                 since = args[idx + 1]
-        acct = self._session_db.find_mail_account_by_alias(alias, str(source.user_id))
+        acct = self._session_db.find_mail_account_by_alias(str(source.user_id), alias)
         if not acct:
             return f"Caixa *{alias}* não encontrada. Use /email_connect primeiro."
         # Dedup: check for active job
@@ -3592,7 +3593,7 @@ class GatewayRunner:
         alias = event.get_command_args().strip()
         owner_id = str(source.user_id)
         if alias:
-            acct = self._session_db.find_mail_account_by_alias(alias, owner_id)
+            acct = self._session_db.find_mail_account_by_alias(owner_id, alias)
             if not acct:
                 return f"Caixa *{alias}* não encontrada."
             jobs = self._session_db.list_backfill_jobs_by_account(acct["account_id"])
@@ -3707,6 +3708,34 @@ class GatewayRunner:
             quiet_hours_end=end_h,
         )
         return f"🌙 Quiet hours de *{alias}* configuradas: {start_h:02d}h–{end_h:02d}h UTC."
+
+    async def _maybe_intercept_email_credentials(
+        self, *, message_text: str, owner_id: str
+    ) -> Optional[str]:
+        """Detect '<alias> <host> <email> <password>' reply from owner (022 US2)."""
+        import re as _re
+        text = message_text.strip()
+        # Must have exactly 4 whitespace-separated tokens; host must contain a dot;
+        # username must contain @; password is whatever remains (may contain spaces
+        # if pasted with hyphens — Gmail app-passwords have format xxxx-xxxx-xxxx-xxxx)
+        parts = text.split()
+        if len(parts) < 4:
+            return None
+        alias, host, username = parts[0], parts[1], parts[2]
+        password = " ".join(parts[3:])
+        if "." not in host or "@" not in username:
+            return None
+        # Must have a matching pending account in session_db (created by /email_connect)
+        if self._session_db is None:
+            return None
+        existing = self._session_db.find_mail_account_by_alias(owner_id, alias)
+        # Only intercept if NO live account exists yet (i.e. user is in setup flow)
+        # OR if account exists but is in disconnected state
+        if existing and existing.get("connection_state") == "live":
+            return None
+        return await self._handle_email_connect_with_password(
+            alias, host, username, password, owner_id
+        )
 
     async def _maybe_intercept_document_extraction(
         self,
@@ -5634,6 +5663,26 @@ class GatewayRunner:
                 except Exception as e:
                     logger.warning("document extraction reply send failed: %s", e)
             return
+
+        # 022: email credentials intercept.
+        # Owner sends "<alias> <host> <username> <password>" as a plain-text reply
+        # to the /email_connect password prompt.
+        if (
+            message_text
+            and self._contact_manager
+            and self._contact_manager.is_owner(source.user_id)
+        ):
+            _email_cred_reply = await self._maybe_intercept_email_credentials(
+                message_text=message_text, owner_id=str(source.user_id)
+            )
+            if _email_cred_reply is not None:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    try:
+                        await adapter.send(source.chat_id, _email_cred_reply)
+                    except Exception as e:
+                        logger.warning("email credentials reply send failed: %s", e)
+                return
 
         try:
             # Emit agent:start hook

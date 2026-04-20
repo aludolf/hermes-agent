@@ -41,10 +41,11 @@ class EmailSentinel:
     One _WatcherTask per mail_watch row; tasks are stored in self._tasks.
     """
 
-    def __init__(self, *, session_db, extraction_queue, owner_id: str) -> None:
+    def __init__(self, *, session_db, extraction_queue, owner_id: str, credentials_store=None) -> None:
         self._db = session_db
         self._queue = extraction_queue
         self._owner_id = owner_id
+        self._credentials_store = credentials_store
         self._tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------
@@ -86,6 +87,10 @@ class EmailSentinel:
     ) -> dict:
         """Store credential, create mail_account row, probe IMAP once."""
         from uuid import uuid4
+        # Remove any pre-existing disconnected account with the same alias
+        existing = self._db.find_mail_account_by_alias(owner_id, alias)
+        if existing and existing.get("connection_state") != "live":
+            self._db.delete_mail_account(existing["account_id"])
         cred_kind = "imap_xoauth2_refresh_token" if auth_method == "xoauth2" else "imap_app_password"
         cred_id = credentials_store.put(kind=cred_kind, secret=secret, label=f"{alias}-{username}")
         account_id = f"ma_{uuid4().hex[:12]}"
@@ -326,12 +331,15 @@ class EmailSentinel:
     # ------------------------------------------------------------------
 
     async def _load_secret(self, acct: dict) -> str:
-        """Load the credential secret from the credentials store."""
+        """Decrypt and return the credential secret."""
         cred_ref = acct.get("credential_ref", "")
+        if self._credentials_store:
+            return self._credentials_store.get(cred_ref)
+        # Fallback: read raw bytes (only works if stored unencrypted)
         row = self._db.get_credential_ciphertext(cred_ref)
         if not row:
             raise EmailSentinelError(f"Credential {cred_ref!r} not found")
-        return bytes(row["ciphertext"]).decode("utf-8")  # raw secret (decrypted by CredentialsStore layer above)
+        return bytes(row["ciphertext"]).decode("utf-8")
 
     async def _probe_imap(
         self, host: str, port: int, username: str, auth_method: str, secret: str
