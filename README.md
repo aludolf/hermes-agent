@@ -1,3 +1,21 @@
+<!-- ───────────────────────────────────────────────────────────── -->
+
+> # ⚠️ DEPRECATED — archived fork
+>
+> `aludolf/hermes-agent` is a **deprecated** fork of `NousResearch/hermes-agent`.
+> The live Hermes runtime no longer builds from this fork: it pulls the
+> **unmodified upstream image** and layers every customization as
+> sidecars/plugins in
+> [`aludolf/hermes-runtime`](https://github.com/aludolf/hermes-runtime).
+>
+> Kept read-only for history — notably the `022-teams-email-sentinels` branch's
+> MS-Teams sentinel modules, which have no runtime successor yet and are
+> recoverable from git if Teams ingestion is ever revived.
+>
+> **Do not build or deploy from here.** (2026-07-01)
+
+<!-- ───────────────────────────────────────────────────────────── -->
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
